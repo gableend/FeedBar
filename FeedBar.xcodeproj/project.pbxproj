@@ -21,12 +21,12 @@
 			membershipExceptions = (
 				AIDiscoveryService.swift,
 				AppCoordinator.swift,
+				FeedBarApp.swift,
 				FeedManager.swift,
 				Helpers.swift,
 				Models.swift,
 				Secrets.swift,
 				SettingsView.swift,
-				SuperTickerApp.swift,
 				TickerView.swift,
 				TickerWindow.swift,
 				TrendProvider.swift,

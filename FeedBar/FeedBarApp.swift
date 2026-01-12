@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct SuperTickerApp: App {
+struct FeedBarApp: App {
     // We bind the AppDelegate here to handle startup logic
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
