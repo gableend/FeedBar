@@ -1,4 +1,4 @@
-import Foundation
+ import Foundation
 import SwiftUI
 
 // MARK: - 1. FEEDS BRAND KIT
@@ -14,6 +14,21 @@ struct FeedsTheme {
     static let ai = Color(hex: "4C7DFF")         // Signal Blue
     static let trends = Color(hex: "4FA3A5")     // Muted Teal
     static let utility = Color(hex: "C9A24D")    // Soft Amber
+
+    static func categoryColor(for category: String) -> Color {
+        let c = category.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+
+        if c.contains("AI") || c.contains("RESEARCH") { return FeedsTheme.ai }
+        if c.contains("TECH") || c.contains("PROGRAMMING") || c.contains("COMPANY") || c.contains("ENGINEERING") { return FeedsTheme.futurism }
+        if c.contains("BUSINESS") || c.contains("FINANCE") || c.contains("MARKET") || c.contains("ECONOM") { return FeedsTheme.trends }
+        if c.contains("SPORT") { return FeedsTheme.trends }
+        if c.contains("TREND") { return FeedsTheme.trends }
+        if c.contains("WEATHER") || c.contains("UTILITY") { return FeedsTheme.utility }
+        if c.contains("FUTURE") { return FeedsTheme.futurism }
+        if c.contains("TOPIC") || c.contains("TOPICS") { return FeedsTheme.ai }
+
+        return FeedsTheme.news
+    }
 }
 
 // MARK: - 2. TICKER ITEM MODEL
@@ -42,6 +57,11 @@ struct TickerItem: Identifiable, Hashable, Equatable, Codable {
 
     // Logic: Map Content -> Signal Colour
     var accentColor: Color {
+        // Prefer a category-based color if available (value carries topicName or category)
+        if let v = value, !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return FeedsTheme.categoryColor(for: v)
+        }
+
         if sourceName == "Local Weather" { return FeedsTheme.utility }
 
         // Safety: If it's labeled TRENDS, always use the trends color
@@ -115,7 +135,19 @@ struct FeedSource: Identifiable {
     let url: String
     let domain: String
     let defaultEnabled: Bool
-    var settingKey: String { "source_\(domain)" }
+    let category: String
+
+    var settingKey: String {
+        let safe = url
+            .lowercased()
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "?", with: "_")
+            .replacingOccurrences(of: "&", with: "_")
+            .replacingOccurrences(of: "=", with: "_")
+        return "source_\(domain)_\(safe)"
+    }
 }
 
 struct CustomFeed: Identifiable, Codable, Hashable {

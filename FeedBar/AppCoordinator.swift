@@ -57,7 +57,13 @@ class AppCoordinator: NSObject, ObservableObject {
         var initialSize = defaults.integer(forKey: "tickerSize")
         if initialSize == 0 { initialSize = 1 } // Default to size 1 if not set
         
-        let initialMonitor = defaults.string(forKey: "preferredMonitor") ?? ""
+        var initialMonitor = defaults.string(forKey: "preferredMonitor") ?? ""
+        // If there's no stored preference, default to the main screen's numeric id if available
+        if initialMonitor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let main = NSScreen.main, let num = main.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                initialMonitor = String(num.uint32Value)
+            }
+        }
         let initialOnTop = defaults.object(forKey: "alwaysOnTop") as? Bool ?? true
         let initialShowAdmin = defaults.object(forKey: "showAdminAtStartup") as? Bool ?? true
         
@@ -82,7 +88,6 @@ class AppCoordinator: NSObject, ObservableObject {
     
     // MARK: - ADMIN DASHBOARD
     
-    // Renamed to openSettings to match TickerView call site
     func openSettings() {
         if let win = settingsWindow {
             win.makeKeyAndOrderFront(nil)
@@ -90,14 +95,18 @@ class AppCoordinator: NSObject, ObservableObject {
             return
         }
         
-        let window = createBaseWindow(width: 800, height: 550)
+        // 1. Updated Dimensions to match SettingsView (800x650)
+        let w: CGFloat = 800
+        let h: CGFloat = 650
+        let window = createBaseWindow(width: w, height: h)
         
-        // Smart Positioning: Find screen with mouse
+        // Smart Positioning: Find screen with mouse and center mathematically
         let mouseLoc = NSEvent.mouseLocation
         if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) {
             let screenFrame = screen.visibleFrame
-            let x = screenFrame.midX - 400
-            let y = screenFrame.midY - 275
+            // Calculate center point based on visible frame (respecting Dock/Menu Bar)
+            let x = screenFrame.midX - (w / 2)
+            let y = screenFrame.midY - (h / 2)
             window.setFrameOrigin(NSPoint(x: x, y: y))
         } else {
             window.center()
@@ -119,14 +128,17 @@ class AppCoordinator: NSObject, ObservableObject {
         if tickerWindow == nil {
             let panel = NSPanel(
                 contentRect: .zero,
-                styleMask: [.nonactivatingPanel],
+                styleMask: [.nonactivatingPanel, .hudWindow, .borderless],
                 backing: .buffered, defer: false
             )
             panel.backgroundColor = .clear
             panel.hasShadow = false
             panel.level = alwaysOnTop ? (.mainMenu + 1) : .normal
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            
+            panel.isOpaque = false
+            panel.isMovableByWindowBackground = false
+            panel.isMovable = false
+
             let view = TickerView(feedManager: feedManager, coordinator: self)
             panel.contentView = NSHostingView(rootView: view)
             self.tickerWindow = panel
@@ -145,30 +157,72 @@ class AppCoordinator: NSObject, ObservableObject {
     
     private func updateWindowPosition() {
         guard let panel = tickerWindow else { return }
-        
+
         let screens = NSScreen.screens
-        var targetScreen = NSScreen.main
-        if !preferredMonitorName.isEmpty, let preferred = screens.first(where: { $0.localizedName == preferredMonitorName }) {
-            targetScreen = preferred
+        var targetScreen: NSScreen?
+        let prefRaw = preferredMonitorName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1) Try numeric display ID match first
+        if let idNum = UInt32(prefRaw) {
+            targetScreen = screens.first(where: { scr in
+                if let num = scr.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                    return num.uint32Value == idNum
+                }
+                return false
+            })
         }
+
+        // 2) If still not found and pref empty, choose the screen under the mouse
+        if targetScreen == nil && prefRaw.isEmpty {
+            let mouseLoc = NSEvent.mouseLocation
+            targetScreen = screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main
+        }
+
+        // 3) If pref suggests built-in/internal, map to main screen
+        if targetScreen == nil && !prefRaw.isEmpty {
+            let loweredPref = prefRaw.lowercased()
+            if ["built", "retina", "internal", "builtin", "laptop", "built-in"].contains(where: { loweredPref.contains($0) }) {
+                targetScreen = NSScreen.main
+            }
+        }
+
+        // 4) Fuzzy name matching fallback
+        if targetScreen == nil && !prefRaw.isEmpty {
+            let loweredPref = prefRaw.lowercased()
+            let matches = screens.filter { screen in
+                let name = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return name == loweredPref || name.contains(loweredPref) || loweredPref.contains(name)
+            }
+            if matches.count == 1 {
+                targetScreen = matches.first
+            } else if matches.count > 1 {
+                let mouseLoc = NSEvent.mouseLocation
+                targetScreen = matches.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? matches.first
+            } else {
+                targetScreen = screens.first(where: { $0.localizedName == prefRaw })
+            }
+        }
+
+        if targetScreen == nil { targetScreen = NSScreen.main }
         guard let screen = targetScreen else { return }
-        
-        let height: CGFloat = (tickerSize == 1 ? 32 : (tickerSize == 2 ? 48 : 80))
-        let screenFrame = screen.frame
+
+        // Use the same height mapping as TickerView.heightForSize(_:) to avoid clipping
+        let height: CGFloat = (tickerSize == 1 ? 48 : (tickerSize == 4 ? 108 : 72))
+
+        // Use visibleFrame origin/width so we position inside the usable area (accounts for Dock/Menu Bar)
         let visibleFrame = screen.visibleFrame // Accounts for Dock/Menu Bar
-        
-        let x = screenFrame.origin.x
-        let width = screenFrame.width
+        let x = visibleFrame.origin.x
+        let width = visibleFrame.width
         var y: CGFloat = 0
-        
+
         if tickerPositionString == "top" {
-            // Sit BELOW the menu bar
+            // Sit directly below the menu bar
             y = visibleFrame.maxY - height
         } else {
             // Sit ABOVE bottom safe area (Dock)
             y = visibleFrame.minY
         }
-        
+
         let newFrame = NSRect(x: x, y: y, width: width, height: height)
         panel.setFrame(newFrame, display: true, animate: false)
     }
@@ -179,6 +233,7 @@ class AppCoordinator: NSObject, ObservableObject {
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered, defer: false
         )
+        // Center initially on main screen, but openSettings will override for mouse screen
         window.center()
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden

@@ -1,15 +1,244 @@
 //
 //  FeedManager.swift
-//  SuperTicker
+//  FeedBar
 //
 
 import Foundation
 import Combine
 import SwiftUI
 import CoreLocation
+import QuartzCore
 
+// MARK: - Staleness helpers (explicitly nonisolated, Swift-6 safe)
+enum Staleness {
+    nonisolated static func cutoff(maxDays: Int, now: Date) -> Date {
+        if let d = Calendar.current.date(byAdding: .day, value: -maxDays, to: now) { return d }
+        return now.addingTimeInterval(TimeInterval(-maxDays * 24 * 60 * 60))
+    }
+
+    nonisolated static func isStale(_ publishedAt: Date?, maxDays: Int, now: Date) -> Bool {
+        guard let d = publishedAt else { return false }
+        return d < cutoff(maxDays: maxDays, now: now)
+    }
+}
+
+// MARK: - Safe, Non-Blocking Concurrency Primitives
+
+actor AsyncSemaphore {
+    private var permits: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(_ value: Int) {
+        self.permits = max(1, value)
+    }
+
+    func acquire() async {
+        if permits > 0 {
+            permits -= 1
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    func release() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume()
+        } else {
+            permits += 1
+        }
+    }
+}
+
+actor HostLimiter {
+    private let perHostLimit: Int
+    private var inFlight: [String: Int] = [:]
+    private var queues: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    init(perHostLimit: Int) {
+        self.perHostLimit = max(1, perHostLimit)
+    }
+
+    func acquire(host: String) async {
+        let h = host.lowercased()
+        let current = inFlight[h] ?? 0
+        
+        if current < perHostLimit {
+            inFlight[h] = current + 1
+            return
+        }
+        
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queues[h, default: []].append(cont)
+        }
+    }
+
+    func release(host: String) {
+        let h = host.lowercased()
+        let current = inFlight[h] ?? 0
+        guard current > 0 else { return }
+
+        if var q = queues[h], !q.isEmpty {
+            let cont = q.removeFirst()
+            queues[h] = q
+            cont.resume()
+            return
+        }
+
+        inFlight[h] = current - 1
+    }
+}
+
+// MARK: - Safe dedupe key
+struct TickerKey: Hashable, Sendable {
+    let text: String
+    let sourceName: String
+    let articleURL: String
+
+    init(_ item: TickerItem) {
+        self.text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.sourceName = item.sourceName
+        self.articleURL = item.articleURL.absoluteString
+    }
+}
+
+// MARK: - Background RSS fetcher
+actor FeedFetcher {
+    struct FetchMeta: Sendable {
+        let statusCode: Int?
+        let requestId: String?
+        let contentType: String?
+        let bytes: Int
+        let durationMs: Int
+        let finalURL: String
+    }
+
+    private let session: URLSession
+    private let userAgent: String
+    private let acceptHeader: String
+    private let acceptLanguage: String
+    private let maxItemAgeDays: Int
+    private let debug: @Sendable (String) -> Void
+
+    private let networkGate: AsyncSemaphore
+    private let hostGate: HostLimiter
+
+    init(
+        session: URLSession,
+        userAgent: String,
+        acceptHeader: String,
+        acceptLanguage: String,
+        maxItemAgeDays: Int,
+        maxConcurrentRequests: Int,
+        perHostLimit: Int,
+        debug: @escaping @Sendable (String) -> Void
+    ) {
+        self.session = session
+        self.userAgent = userAgent
+        self.acceptHeader = acceptHeader
+        self.acceptLanguage = acceptLanguage
+        self.maxItemAgeDays = maxItemAgeDays
+        self.debug = debug
+
+        self.networkGate = AsyncSemaphore(maxConcurrentRequests)
+        self.hostGate = HostLimiter(perHostLimit: perHostLimit)
+    }
+
+    func fetchRSSWithMeta(
+        source: FeedSource,
+        type: TickerType,
+        topicName: String,
+        forceNetwork: Bool
+    ) async -> ([TickerItem], FetchMeta) {
+        guard let url = URL(string: source.url) else {
+            return ([], FetchMeta(statusCode: nil, requestId: nil, contentType: nil, bytes: 0, durationMs: 0, finalURL: source.url))
+        }
+
+        // Acquire global lock then host lock
+        await networkGate.acquire()
+        await hostGate.acquire(host: source.domain)
+        
+        defer {
+            Task { await self.hostGate.release(host: source.domain) }
+            Task { await self.networkGate.release() }
+        }
+
+        let start = CFAbsoluteTimeGetCurrent()
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 30.0
+            request.cachePolicy = forceNetwork ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue(acceptHeader, forHTTPHeaderField: "Accept")
+            request.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
+
+            debug("RSS → \(source.name) host=\(source.domain) force=\(forceNetwork ? "true" : "false") url=\(source.url)")
+
+            let (data, response) = try await session.data(for: request)
+
+            let http = response as? HTTPURLResponse
+            let code = http?.statusCode
+            let reqId = http?.value(forHTTPHeaderField: "x-request-id")
+            let contentType = http?.value(forHTTPHeaderField: "Content-Type")
+
+            let durMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000.0)
+
+            if let code, !(200...299).contains(code) {
+                debug("❌ RSS HTTP \(code) (\(durMs)ms) \(source.name) ct=\(contentType ?? "n/a") url=\(source.url)")
+                return ([], FetchMeta(statusCode: code, requestId: reqId, contentType: contentType, bytes: data.count, durationMs: durMs, finalURL: source.url))
+            }
+
+            let parsed = await parseXMLOffMain(
+                data: data,
+                source: source,
+                type: type,
+                topicName: topicName,
+                maxAgeDays: maxItemAgeDays
+            )
+
+            if parsed.isEmpty {
+                debug("⚠️ RSS parsed 0 items (\(durMs)ms) \(source.name) topic=\(topicName) ct=\(contentType ?? "n/a") url=\(source.url)")
+            } else {
+                debug("RSS ✓ \(parsed.count) items (\(durMs)ms) \(source.name) ct=\(contentType ?? "n/a")")
+            }
+
+            let now = Date()
+            let fresh = parsed.filter { !Staleness.isStale($0.publishedAt, maxDays: maxItemAgeDays, now: now) }
+
+            return (fresh, FetchMeta(statusCode: code, requestId: reqId, contentType: contentType, bytes: data.count, durationMs: durMs, finalURL: source.url))
+        } catch {
+            let durMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000.0)
+            debug("❌ RSS fetch error (\(durMs)ms) \(source.name): \(error.localizedDescription) url=\(source.url)")
+            return ([], FetchMeta(statusCode: nil, requestId: nil, contentType: nil, bytes: 0, durationMs: durMs, finalURL: source.url))
+        }
+    }
+
+    private func parseXMLOffMain(
+        data: Data,
+        source: FeedSource,
+        type: TickerType,
+        topicName: String,
+        maxAgeDays: Int
+    ) async -> [TickerItem] {
+        await Task.detached(priority: .userInitiated) {
+            let parser = RSSParser(
+                data: data,
+                source: source,
+                type: type,
+                topicName: topicName,
+                maxAgeDays: maxAgeDays
+            )
+            return parser.parse()
+        }.value
+    }
+}
+
+// MARK: - FeedManager
 @MainActor
-class FeedManager: NSObject, ObservableObject {
+final class FeedManager: NSObject, ObservableObject {
     @Published var items: [TickerItem] = []
     @Published var itemsRevision: Int = 0
     @Published var sources: [FeedSource] = []
@@ -17,186 +246,128 @@ class FeedManager: NSObject, ObservableObject {
     @Published var lastHealthCheckSummary: String? = nil
     @Published var isRunningHealthCheck: Bool = false
 
-    // ✅ AI sentiment “orb” state
     struct NewsSentiment: Equatable {
         enum Level: String, Codable { case green, amber, red }
-
         let level: Level
-        let threeWordSummary: String   // e.g. "Rates Rise Again"
+        let threeWordSummary: String
         let computedAt: Date
     }
 
     @Published var newsSentiment: NewsSentiment? = nil
     @Published var isComputingSentiment: Bool = false
 
-    // Cache so we don’t call repeatedly
     private var sentimentCacheDayKey: String? = nil
     private var sentimentTask: Task<Void, Never>? = nil
 
+    // MARK: - Networking config
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 8.0
-        config.timeoutIntervalForResource = 15.0
+        config.timeoutIntervalForRequest = 20.0
+        config.timeoutIntervalForResource = 45.0
         config.urlCache = URLCache.shared
         config.requestCachePolicy = .useProtocolCachePolicy
+        config.httpMaximumConnectionsPerHost = 6
+        config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }()
 
-    private let trendProvider: any TrendProvider
-    private var refreshTask: Task<Void, Never>?
-    private var autoRefreshTask: Task<Void, Never>?
-
-    // ✅ Trends moved out of the main load path (separate process/task)
-    private var trendsTask: Task<Void, Never>?
-    private var lastTrendsRefreshAt: Date? = nil
-    private let trendsMinIntervalSeconds: TimeInterval = 60 * 60 // 1 hour throttle
-    private let trendsInitialDelaySeconds: TimeInterval = 90      // show up later, not blocking first paint
-
-    private var loadedNews: Set<TickerItem> = []
-    private var lastNetworkRefreshAt: Date? = nil
-
-    // Lazy OG image enrichment
-    private let ogEnricher = OGImageEnricher()
-
-    // MARK: - Request headers (critical for feeds that 403 "bots")
     private let userAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
     private let acceptHeader =
         "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
     private let acceptLanguage = "en-IE,en;q=0.9"
 
-    // MARK: - Freshness rules
     private let maxItemAgeDays: Int = 90
-
-    // MARK: - Refresh policy
-    private let refreshIntervalSeconds: TimeInterval = 30 * 60    // 30 minutes
-    private let initialHealthCheckDelay: TimeInterval = 5 * 60    // 5 minutes
-
-    // MARK: - Mixer policy
+    private let initialHealthCheckDelay: TimeInterval = 5 * 60
     private let maxPerSourcePerCategory: Int = 12
     private let maxVisibleItems: Int = 200
 
-    // MARK: - Sources
-    private let defaultSources: [FeedSource] = [
-        FeedSource(name: "BBC News", url: "https://feeds.bbci.co.uk/news/rss.xml", domain: "bbc.co.uk", defaultEnabled: true),
-        FeedSource(name: "The Guardian World", url: "https://www.theguardian.com/world/rss", domain: "theguardian.com", defaultEnabled: true),
-        FeedSource(name: "CNN Top Stories", url: "http://rss.cnn.com/rss/cnn_topstories.rss", domain: "cnn.com", defaultEnabled: true),
-        FeedSource(name: "Sky News", url: "https://feeds.skynews.com/feeds/rss/home.xml", domain: "skynews.com", defaultEnabled: false),
-        FeedSource(name: "NPR Top Stories", url: "https://feeds.npr.org/1001/rss.xml", domain: "npr.org", defaultEnabled: true),
-        FeedSource(name: "Al Jazeera", url: "https://www.aljazeera.com/xml/rss/all.xml", domain: "aljazeera.com", defaultEnabled: false),
-        FeedSource(name: "Deutsche Welle", url: "https://rss.dw.com/rdf/rss-en-all", domain: "dw.com", defaultEnabled: false),
-        FeedSource(name: "Financial Times", url: "https://www.ft.com/?format=rss", domain: "ft.com", defaultEnabled: true),
-        FeedSource(name: "WSJ World News", url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml", domain: "wsj.com", defaultEnabled: false),
-        FeedSource(name: "WSJ Tech", url: "https://feeds.a.dj.com/rss/RSSWSJD.xml", domain: "wsj.com", defaultEnabled: false),
-        FeedSource(name: "Bloomberg Technology", url: "https://www.bloomberg.com/feed/podcast/etf-report.xml", domain: "bloomberg.com", defaultEnabled: false),
-        FeedSource(name: "Harvard Business Review", url: "https://hbr.org/feed", domain: "hbr.org", defaultEnabled: false),
-        FeedSource(name: "McKinsey Insights", url: "https://www.mckinsey.com/featured-insights/rss", domain: "mckinsey.com", defaultEnabled: false),
+    private let debugToFile = true
+    private let debugFilePath = "/tmp/feedbar_debug.log"
+    private var lastConfigDumpKey: String? = nil
+    private var lastNetworkRefreshAt: Date? = nil
 
-        FeedSource(name: "Hacker News", url: "https://news.ycombinator.com/rss", domain: "ycombinator.com", defaultEnabled: true),
-        FeedSource(name: "Ars Technica", url: "https://feeds.arstechnica.com/arstechnica/index", domain: "arstechnica.com", defaultEnabled: true),
-        FeedSource(name: "The Verge", url: "https://www.theverge.com/rss/index.xml", domain: "theverge.com", defaultEnabled: false),
-        FeedSource(name: "Wired", url: "https://www.wired.com/feed/rss", domain: "wired.com", defaultEnabled: false),
-        FeedSource(name: "TechCrunch", url: "https://techcrunch.com/feed/", domain: "techcrunch.com", defaultEnabled: true),
-        FeedSource(name: "The Register", url: "https://www.theregister.com/headlines.atom", domain: "theregister.com", defaultEnabled: false),
-        FeedSource(name: "MIT Technology Review", url: "https://www.technologyreview.com/topnews.rss", domain: "technologyreview.com", defaultEnabled: true),
-        FeedSource(name: "IEEE Spectrum", url: "https://spectrum.ieee.org/rss/fulltext", domain: "ieee.org", defaultEnabled: false),
+    private enum LogLevel: Int { case off = 0, error = 1, info = 2, verbose = 3 }
+    private let logLevel: LogLevel = .verbose
 
-        FeedSource(name: "YC News", url: "https://www.ycombinator.com/blog/rss", domain: "ycombinator.com", defaultEnabled: false),
-        FeedSource(name: "a16z", url: "https://a16z.com/feed/", domain: "a16z.com", defaultEnabled: false),
-        FeedSource(name: "Sequoia", url: "https://www.sequoiacap.com/feed/", domain: "sequoiacap.com", defaultEnabled: false),
-        FeedSource(name: "First Round Review", url: "https://review.firstround.com/rss", domain: "firstround.com", defaultEnabled: false),
+    // Trends
+    private let trendProvider: any TrendProvider
+    private var trendsTask: Task<Void, Never>?
+    private var lastTrendsRefreshAt: Date? = nil
+    private let trendsMinIntervalSeconds: TimeInterval = 60 * 60
+    private let trendsInitialDelaySeconds: TimeInterval = 90
 
-        FeedSource(name: "GitHub Blog", url: "https://github.blog/feed/", domain: "github.blog", defaultEnabled: false),
-        FeedSource(name: "GitHub Changelog", url: "https://github.blog/changelog/feed/", domain: "github.blog", defaultEnabled: false),
-        FeedSource(name: "AWS News Blog", url: "https://aws.amazon.com/blogs/aws/feed/", domain: "aws.amazon.com", defaultEnabled: false),
-        FeedSource(name: "Google AI Blog", url: "https://ai.googleblog.com/feeds/posts/default", domain: "googleblog.com", defaultEnabled: false),
-        FeedSource(name: "Google Security Blog", url: "https://security.googleblog.com/feeds/posts/default", domain: "googleblog.com", defaultEnabled: false),
-        FeedSource(name: "Cloudflare Blog", url: "https://blog.cloudflare.com/rss/", domain: "cloudflare.com", defaultEnabled: false),
-        FeedSource(name: "Stripe Blog", url: "https://stripe.com/blog/feed.rss", domain: "stripe.com", defaultEnabled: false),
-        FeedSource(name: "Shopify Engineering", url: "https://shopify.engineering/blog.atom", domain: "shopify.engineering", defaultEnabled: false),
+    // Refresh tasks
+    private var refreshTask: Task<Void, Never>?
+    private var autoRefreshTask: Task<Void, Never>?
 
-        FeedSource(name: "Krebs on Security", url: "https://krebsonsecurity.com/feed/", domain: "krebsonsecurity.com", defaultEnabled: false),
-        FeedSource(name: "Schneier on Security", url: "https://www.schneier.com/feed/atom/", domain: "schneier.com", defaultEnabled: false),
-        FeedSource(name: "The Hacker News", url: "https://feeds.feedburner.com/TheHackersNews", domain: "thehackernews.com", defaultEnabled: false),
+    // Cache
+    private var allFeedItems: [TickerItem] = []
+    private var trendItems: [TickerItem] = []
+    private var loadedNews: [TickerItem] = []
 
-        FeedSource(name: "OpenAI News", url: "https://openai.com/news/rss.xml", domain: "openai.com", defaultEnabled: true),
-        FeedSource(name: "DeepMind Blog", url: "https://deepmind.google/discover/blog/rss.xml", domain: "deepmind.google", defaultEnabled: false),
-        FeedSource(name: "Anthropic News", url: "https://www.anthropic.com/news/rss.xml", domain: "anthropic.com", defaultEnabled: false),
-        FeedSource(name: "Google Research", url: "https://research.google/blog/rss/", domain: "google.com", defaultEnabled: false),
-        FeedSource(name: "Meta AI", url: "https://ai.meta.com/blog/rss/", domain: "meta.com", defaultEnabled: false),
-        FeedSource(name: "Hugging Face Blog", url: "https://huggingface.co/blog/feed.xml", domain: "huggingface.co", defaultEnabled: false),
+    // OG enrichment
+    private let ogEnricher = OGImageEnricher()
+    private var lastOGEnrichAt: Date? = nil
 
-        FeedSource(name: "arXiv AI", url: "https://export.arxiv.org/rss/cs.AI", domain: "arxiv.org", defaultEnabled: false),
-        FeedSource(name: "arXiv ML", url: "https://export.arxiv.org/rss/cs.LG", domain: "arxiv.org", defaultEnabled: false),
-        FeedSource(name: "arXiv HCI", url: "https://export.arxiv.org/rss/cs.HC", domain: "arxiv.org", defaultEnabled: false),
-        FeedSource(name: "arXiv Security", url: "https://export.arxiv.org/rss/cs.CR", domain: "arxiv.org", defaultEnabled: false),
+    // Fetcher
+    private lazy var fetcher: FeedFetcher = {
+        let debug: @Sendable (String) -> Void = { [weak self] msg in
+            guard let self else { return }
+            Task { @MainActor in
+                let level: LogLevel
+                if msg.hasPrefix("❌") { level = .error }
+                else if msg.hasPrefix("⚠️") { level = .info }
+                else if msg.hasPrefix("RSS ✓") { level = .info }
+                else if msg.hasPrefix("RSS →") { level = .verbose }
+                else { level = .verbose }
 
-        FeedSource(name: "Nielsen Norman Group", url: "https://www.nngroup.com/feed/rss/", domain: "nngroup.com", defaultEnabled: false),
-        FeedSource(name: "Inside Intercom", url: "https://www.intercom.com/blog/feed/", domain: "intercom.com", defaultEnabled: false),
-        FeedSource(name: "Figma Blog", url: "https://www.figma.com/blog/rss.xml", domain: "figma.com", defaultEnabled: false),
+                self.dbg(msg, level: level)
+            }
+        }
 
-        FeedSource(name: "Stratechery", url: "https://stratechery.com/feed/", domain: "stratechery.com", defaultEnabled: false),
-        FeedSource(name: "Benedict Evans", url: "https://www.ben-evans.com/benedictevans?format=rss", domain: "ben-evans.com", defaultEnabled: false),
+        return FeedFetcher(
+            session: self.session,
+            userAgent: self.userAgent,
+            acceptHeader: self.acceptHeader,
+            acceptLanguage: self.acceptLanguage,
+            maxItemAgeDays: self.maxItemAgeDays,
+            maxConcurrentRequests: 10,
+            perHostLimit: 2,
+            debug: debug
+        )
+    }()
 
-        FeedSource(name: "NOAA Climate", url: "https://www.climate.gov/feeds/news-features/rss.xml", domain: "climate.gov", defaultEnabled: false),
-        FeedSource(name: "IEA News", url: "https://www.iea.org/rss/news.xml", domain: "iea.org", defaultEnabled: false),
-
-        FeedSource(name: "BBC Business", url: "https://feeds.bbci.co.uk/news/business/rss.xml", domain: "bbc.co.uk", defaultEnabled: false),
-        FeedSource(name: "BBC Technology", url: "https://feeds.bbci.co.uk/news/technology/rss.xml", domain: "bbc.co.uk", defaultEnabled: false),
-        FeedSource(name: "Guardian Technology", url: "https://www.theguardian.com/uk/technology/rss", domain: "theguardian.com", defaultEnabled: false),
-        FeedSource(name: "Guardian Business", url: "https://www.theguardian.com/uk/business/rss", domain: "theguardian.com", defaultEnabled: false),
-        FeedSource(name: "NPR Technology", url: "https://feeds.npr.org/1019/rss.xml", domain: "npr.org", defaultEnabled: false),
-        FeedSource(name: "NPR Planet Money", url: "https://feeds.npr.org/510289/podcast.xml", domain: "npr.org", defaultEnabled: false),
-        FeedSource(name: "NPR Consider This", url: "https://feeds.npr.org/510355/podcast.xml", domain: "npr.org", defaultEnabled: false),
-
-        FeedSource(name: "Apple Newsroom", url: "https://www.apple.com/newsroom/rss-feed.rss", domain: "apple.com", defaultEnabled: false),
-        FeedSource(name: "Microsoft Blog", url: "https://blogs.microsoft.com/feed/", domain: "microsoft.com", defaultEnabled: false),
-        FeedSource(name: "Google Blog", url: "https://blog.google/rss/", domain: "google.com", defaultEnabled: false),
-
-        FeedSource(name: "Mozilla Blog", url: "https://blog.mozilla.org/feed/", domain: "mozilla.org", defaultEnabled: false),
-        FeedSource(name: "Stack Overflow Blog", url: "https://stackoverflow.blog/feed/", domain: "stackoverflow.blog", defaultEnabled: false),
-        FeedSource(name: "JetBrains Blog", url: "https://blog.jetbrains.com/feed/", domain: "jetbrains.com", defaultEnabled: false),
-
-        FeedSource(name: "The Information (if you have access)", url: "https://www.theinformation.com/feed", domain: "theinformation.com", defaultEnabled: false),
-
-        FeedSource(name: "NASA Breaking News", url: "https://www.nasa.gov/rss/dyn/breaking_news.rss", domain: "nasa.gov", defaultEnabled: false),
-        FeedSource(name: "Nature News", url: "https://www.nature.com/subjects/science/rss", domain: "nature.com", defaultEnabled: false),
-        FeedSource(name: "Science Magazine", url: "https://www.science.org/rss/news_current.xml", domain: "science.org", defaultEnabled: false)
-    ]
-
+    // FUTURE / predictions sources
     let predictionSources: [FeedSource] = [
-        FeedSource(name: "Futurism", url: "https://futurism.com/feed", domain: "futurism.com", defaultEnabled: true),
-        FeedSource(name: "Singularity Hub", url: "https://singularityhub.com/feed/", domain: "singularityhub.com", defaultEnabled: true)
+        FeedSource(name: "Futurism", url: "https://futurism.com/feed", domain: "futurism.com", defaultEnabled: true, category: "Future"),
+        FeedSource(name: "Singularity Hub", url: "https://singularityhub.com/feed/", domain: "singularityhub.com", defaultEnabled: true, category: "Future")
     ]
 
     init(trendProvider: (any TrendProvider)? = nil) {
-        if let provider = trendProvider {
-            self.trendProvider = provider
-        } else {
-            self.trendProvider = PythonTrendAdapter()
-        }
+        self.trendProvider = trendProvider ?? PythonTrendAdapter()
         self.sources = defaultSources
         super.init()
 
-        // 1) First paint quickly, then load.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.hardRefresh()
-        }
+        ensureDefaultsOnlyWhenMissing()
+        dbg("initialized (pid:\(ProcessInfo.processInfo.processIdentifier))", level: .info)
 
-        // ✅ Trends: explicitly delayed + separate task so Python can't stall UX
+        dbg("FEEDMANAGER IDENTITY: \(ObjectIdentifier(self))", level: .info)
+        dumpConfigurationIfNeeded(reason: "init")
+
+        // Always show something instantly
+        showBootPlaceholder("Booting signals…")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.hardRefresh() }
         DispatchQueue.main.asyncAfter(deadline: .now() + trendsInitialDelaySeconds) { [weak self] in
             self?.kickOffTrendsIfNeeded(force: false, reason: "startup-delayed")
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + initialHealthCheckDelay) { [weak self] in self?.runHealthCheckNow() }
 
-        // 2) Healthcheck 5 mins after startup (non-blocking for UX)
-        DispatchQueue.main.asyncAfter(deadline: .now() + initialHealthCheckDelay) { [weak self] in
-            self?.runHealthCheckNow()
-        }
+        let minutes = UserDefaults.standard.integer(forKey: "refreshIntervalMinutes")
+        let useMinutes = minutes > 0 ? minutes : 30
+        startAutoRefresh(interval: TimeInterval(useMinutes * 60))
 
-        // 3) Auto refresh every 30 mins (non-blocking; just pulls new items)
-        startAutoRefresh(interval: refreshIntervalSeconds)
-
-        // ✅ AI sentiment: schedule after first paint (non-blocking)
         scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: 7)
     }
 
@@ -207,79 +378,185 @@ class FeedManager: NSObject, ObservableObject {
         sentimentTask?.cancel()
     }
 
-    // MARK: - Centralized visible items setter (always bumps revision)
+    private func ensureDefaultsOnlyWhenMissing() {
+        for s in sources {
+            if UserDefaults.standard.object(forKey: s.settingKey) == nil {
+                UserDefaults.standard.set(s.defaultEnabled, forKey: s.settingKey)
+            }
+        }
+        if UserDefaults.standard.object(forKey: "showTrends") == nil { UserDefaults.standard.set(true, forKey: "showTrends") }
+        if UserDefaults.standard.object(forKey: "showPredictions") == nil { UserDefaults.standard.set(true, forKey: "showPredictions") }
+    }
+
     private func setItems(_ newItems: [TickerItem]) {
         self.items = newItems
         self.itemsRevision &+= 1
     }
 
-    // MARK: - Public: schedule health check
-    func scheduleHealthCheck(after seconds: TimeInterval = 300) {
-        Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            await self.runFeedHealthCheck(reason: "scheduled")
+    private func dbg(_ msg: String, level: LogLevel = .info) {
+        guard level.rawValue <= logLevel.rawValue else { return }
+        let line = "FEEDMANAGER: \(msg)"
+        print(line)
+
+        guard debugToFile else { return }
+        let s = line + "\n"
+        guard let data = s.data(using: .utf8) else { return }
+
+        let url = URL(fileURLWithPath: debugFilePath)
+        if FileManager.default.fileExists(atPath: debugFilePath) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: data)
+                try? fh.close()
+            }
+        } else {
+            try? data.write(to: url)
         }
     }
 
-    // MARK: - Public: validate + add RSS by URL (Admin UI)
-    @MainActor
+    private func showBootPlaceholder(_ msg: String) {
+        let placeholder = TickerItem(
+            text: msg,
+            type: .news,
+            value: "SYSTEM",
+            score: nil,
+            sourceDomain: "feeds.bar",
+            sourceName: "SYSTEM",
+            mediaURL: nil,
+            isVideo: false,
+            articleURL: URL(string: "https://feeds.bar")!,
+            publishedAt: Date()
+        )
+        setItems([placeholder])
+        dbg("UI: placeholder set -> \(msg)", level: .info)
+    }
+
+    private func dumpConfigurationIfNeeded(reason: String) {
+        let snapshot = configurationSnapshotKey()
+        if lastConfigDumpKey == snapshot { return }
+        lastConfigDumpKey = snapshot
+        dumpConfiguration(reason: reason)
+    }
+
+    private func configurationSnapshotKey() -> String {
+        var bits: [String] = []
+        for s in sources { bits.append("\(s.settingKey)=\(isEnabled(s) ? "1" : "0")") }
+        bits.append("showTrends=\(boolDefaultTrue("showTrends") ? "1" : "0")")
+        bits.append("showPredictions=\(boolDefaultTrue("showPredictions") ? "1" : "0")")
+        let customRaw = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
+        bits.append("customRawHash=\(customRaw.hashValue)")
+        return bits.joined(separator: "|")
+    }
+
+    private func dumpConfiguration(reason: String) {
+        dbg("======= CONFIG DUMP (\(reason)) =======", level: .info)
+
+        let grouped = Dictionary(grouping: sources, by: { $0.category.uppercased() })
+        for cat in grouped.keys.sorted() {
+            let list = grouped[cat] ?? []
+            let enabled = list.filter { isEnabled($0) }.sorted(by: { $0.name < $1.name })
+            let disabled = list.filter { !isEnabled($0) }.sorted(by: { $0.name < $1.name })
+
+            dbg("CATEGORY: \(cat) | enabled=\(enabled.count) disabled=\(disabled.count)", level: .info)
+            if !enabled.isEmpty {
+                dbg("  ENABLED:", level: .info)
+                for s in enabled { dbg("    - \(s.name) | domain=\(s.domain) | url=\(s.url)", level: .info) }
+            }
+            if !disabled.isEmpty {
+                dbg("  DISABLED:", level: .info)
+                for s in disabled { dbg("    - \(s.name) | domain=\(s.domain) | url=\(s.url)", level: .info) }
+            }
+        }
+
+        let customData = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
+        if let storage = CustomFeedStorage(rawValue: customData) {
+            dbg("CUSTOM FEEDS: \(storage.feeds.count)", level: .info)
+            for f in storage.feeds {
+                let key = "custom_enabled_\(f.id.uuidString)"
+                let enabled = boolDefaultTrue(key)
+                dbg("  - \(f.name) | enabled=\(enabled ? "true" : "false") | domain=\(f.domain) | url=\(f.url)", level: .info)
+            }
+        } else {
+            dbg("CUSTOM FEEDS: none/invalid storage", level: .info)
+        }
+
+        dbg("FLAGS: showTrends=\(boolDefaultTrue("showTrends")) showPredictions=\(boolDefaultTrue("showPredictions"))", level: .info)
+        dbg("======================================", level: .info)
+    }
+
+    private func boolDefaultTrue(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) == nil ? true : UserDefaults.standard.bool(forKey: key)
+    }
+
+    private func isEnabled(_ source: FeedSource) -> Bool {
+        UserDefaults.standard.object(forKey: source.settingKey) == nil
+            ? source.defaultEnabled
+            : UserDefaults.standard.bool(forKey: source.settingKey)
+    }
+
+    // MARK: - Public: validate + add RSS by URL
     func validateAndAddCustomRSS(urlString: String, providedName: String?) async throws -> CustomFeed {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed),
-              let host = url.host
-        else {
+        guard let url = URL(string: trimmed), let host = url.host else {
             throw NSError(domain: "feeds", code: 400, userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
         }
 
-        // Use existing pipeline to validate
         let domain = host.replacingOccurrences(of: "www.", with: "")
-        let name = {
+        let name: String = {
             let n = (providedName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return n.isEmpty ? domain : n
         }()
 
-        let tempSource = FeedSource(name: name, url: trimmed, domain: domain, defaultEnabled: true)
+        let tempSource = FeedSource(name: name, url: trimmed, domain: domain, defaultEnabled: true, category: "Custom")
+        let (parsed, _) = await fetcher.fetchRSSWithMeta(source: tempSource, type: .news, topicName: name, forceNetwork: true)
 
-        // Force network so we really validate, not cached junk
-        let parsed = await fetchRSS(source: tempSource, type: .news, topicName: "NEWS", forceNetwork: true)
-
-        // If empty/unparseable, reject
         if parsed.isEmpty {
             throw NSError(domain: "feeds", code: 422, userInfo: [NSLocalizedDescriptionKey: "Empty/unparseable feed"])
         }
 
-        // Persist as CustomFeed
         let newFeed = CustomFeed(id: UUID(), name: name, url: trimmed, domain: domain)
 
         let raw = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
         var storage = CustomFeedStorage(rawValue: raw) ?? CustomFeedStorage(feeds: [])
 
-        // Dedupe by URL
         if storage.feeds.contains(where: { $0.url == newFeed.url }) {
             throw NSError(domain: "feeds", code: 409, userInfo: [NSLocalizedDescriptionKey: "Already exists"])
         }
 
         storage.feeds.append(newFeed)
         UserDefaults.standard.set(storage.rawValue, forKey: "customFeeds")
-
-        // Ensure enabled by default
         UserDefaults.standard.set(true, forKey: "custom_enabled_\(newFeed.id.uuidString)")
 
+        dumpConfigurationIfNeeded(reason: "custom-feed-added")
         return newFeed
     }
 
-    // MARK: - Public: manual trigger
-    func runHealthCheckNow() {
-        Task { [weak self] in
+    // MARK: - Public: refresh triggers
+    func softRefresh() {
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
             guard let self else { return }
-            await self.runFeedHealthCheck(reason: "manual")
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await self.progressiveLoad(forceNetwork: false)
         }
     }
 
-    // MARK: - Public: manual trigger for sentiment
-    func refreshNewsSentimentAfterRender(delaySeconds: Double = 0.2) {
-        scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: delaySeconds, force: true)
+    func hardRefresh() {
+        refreshTask?.cancel()
+
+        allFeedItems.removeAll()
+        trendItems.removeAll()
+        loadedNews.removeAll()
+
+        showBootPlaceholder("Refreshing signals…")
+
+        sentimentTask?.cancel()
+        sentimentTask = nil
+
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.progressiveLoad(forceNetwork: true)
+        }
     }
 
     // MARK: - Auto refresh
@@ -305,240 +582,338 @@ class FeedManager: NSObject, ObservableObject {
         if let last = lastNetworkRefreshAt, Date().timeIntervalSince(last) < 5 * 60 { return }
 
         refreshTask?.cancel()
-        refreshTask = Task {
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
             try? await Task.sleep(nanoseconds: 300_000_000)
             await self.progressiveLoad(forceNetwork: true)
         }
     }
 
-    // MARK: - ACTIONS
-    func softRefresh() {
-        refreshTask?.cancel()
-        refreshTask = Task {
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            await self.progressiveLoad(forceNetwork: false)
-        }
-    }
-
-    func hardRefresh() {
-        refreshTask?.cancel()
-        loadedNews.removeAll()
-        setItems([])
-
-        // allow a fresh sentiment attempt if needed (cache still prevents repeat per day)
-        sentimentTask?.cancel()
-        sentimentTask = nil
-
-        Task { await progressiveLoad(forceNetwork: true) }
-    }
-
+    // MARK: - Weather-only refresh
     func refreshWeatherOnly() {
-        Task {
-            if let newWeather = await self.fetchWeather() {
-                var updated = self.items
-                if let index = updated.firstIndex(where: { $0.sourceName == "Local Weather" }) {
-                    updated[index] = newWeather
+        Task { [weak self] in
+            guard let self else { return }
+
+            if let weather = await self.fetchWeather() {
+                var current = self.items
+                if let idx = current.firstIndex(where: { $0.sourceName == "Local Weather" }) {
+                    current[idx] = weather
                 } else {
-                    updated.insert(newWeather, at: 0)
+                    current.insert(weather, at: 0)
                 }
-                self.setItems(updated)
+                if current.count > self.maxVisibleItems {
+                    current = Array(current.prefix(self.maxVisibleItems))
+                }
+                withAnimation { self.setItems(current) }
+            } else {
+                self.dbg("WEATHER: refreshWeatherOnly failed (no result)", level: .info)
             }
         }
     }
 
-    // MARK: - LOGIC
-    private func progressiveLoad(forceNetwork: Bool) async {
-        pruneDisabledItems()
-
-        if let weather = await fetchWeather() {
-            let mixedItems = mixFeeds(self.loadedNews)
-            withAnimation {
-                self.setItems([weather] + Array(mixedItems.prefix(maxVisibleItems - 1)))
+    // MARK: - NEW: quick “is the network blocked?” probe
+    private func networkProbe() async -> Bool {
+        // Known-good, HTTPS, simple RSS
+        guard let url = URL(string: "https://feeds.bbci.co.uk/news/rss.xml") else { return false }
+        do {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 6.0
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            req.setValue(acceptHeader, forHTTPHeaderField: "Accept")
+            req.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
+            let (_, resp) = try await session.data(for: req)
+            if let http = resp as? HTTPURLResponse {
+                dbg("PROBE: BBC RSS HTTP \(http.statusCode)", level: .info)
+                return (200...299).contains(http.statusCode)
             }
+            dbg("PROBE: non-HTTP response", level: .info)
+            return false
+        } catch {
+            dbg("❌ PROBE failed: \(error.localizedDescription)", level: .error)
+            return false
+        }
+    }
+
+    // MARK: - Progressive load
+    private func progressiveLoad(forceNetwork: Bool) async {
+        dbg("PROGRESSIVE: start forceNetwork=\(forceNetwork)", level: .info)
+
+        // Render whatever we have right now
+        rebuildLoadedAndVisible()
+
+        // Weather first (fast)
+        if let weather = await fetchWeather() {
+            let mixed = mixFeeds(loadedNews)
+            withAnimation {
+                self.setItems([weather] + Array(mixed.prefix(max(0, maxVisibleItems - 1))))
+            }
+        } else {
+            let mixed = mixFeeds(loadedNews)
+            withAnimation { self.setItems(Array(mixed.prefix(maxVisibleItems))) }
         }
 
-        // ✅ Schedule sentiment after we have something visible (non-blocking)
         scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: 6)
 
+        // Network
         if forceNetwork {
             lastNetworkRefreshAt = Date()
-        }
+            await fetchAndCacheNetworkProgressive()
+            dbg("PROGRESSIVE: after network allFeedItems=\(allFeedItems.count) loadedNews=\(loadedNews.count)", level: .info)
 
-        await withTaskGroup(of: [TickerItem].self) { group in
-            // A. News
-            for source in sources where isEnabled(source) {
-                group.addTask { await self.fetchRSS(source: source, type: .news, topicName: "NEWS", forceNetwork: forceNetwork) }
-            }
-
-            // B. Predictions
-            let showPredictions = UserDefaults.standard.object(forKey: "showPredictions") == nil
-                ? true
-                : UserDefaults.standard.bool(forKey: "showPredictions")
-
-            if showPredictions {
-                for source in predictionSources {
-                    group.addTask { await self.fetchRSS(source: source, type: .prediction, topicName: "FUTURE", forceNetwork: forceNetwork) }
+            if loadedNews.isEmpty {
+                let ok = await networkProbe()
+                if !ok {
+                    showBootPlaceholder("Network blocked. Check App Sandbox: enable Outgoing Connections (Client).")
+                } else {
+                    showBootPlaceholder("No items loaded. Feeds empty or parser failing. Check /tmp/feedbar_debug.log")
                 }
-            }
-
-            // ✅ C. Trends REMOVED from task group (separate task after refresh)
-
-            // D. Custom
-            let customData = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
-            if let storage = CustomFeedStorage(rawValue: customData) {
-                for custom in storage.feeds {
-                    let key = "custom_enabled_\(custom.id.uuidString)"
-                    let enabled = (UserDefaults.standard.object(forKey: key) == nil)
-                        ? true
-                        : UserDefaults.standard.bool(forKey: key)
-
-                    if enabled {
-                        let source = FeedSource(name: custom.name, url: custom.url, domain: custom.domain, defaultEnabled: true)
-                        group.addTask { await self.fetchRSS(source: source, type: .news, topicName: custom.name, forceNetwork: forceNetwork) }
-                    }
-                }
-            }
-
-            // E. Stream
-            for await batch in group {
-                if batch.isEmpty { continue }
-
-                let freshBatch = batch.filter { !$0.isStale(maxDays: self.maxItemAgeDays) }
-                let newItems = freshBatch.filter { !self.loadedNews.contains($0) }
-                if newItems.isEmpty { continue }
-
-                self.loadedNews.formUnion(newItems)
-                self.loadedNews = self.setPrunedByRecency(self.loadedNews)
-
-                let mixedList = self.mixFeeds(self.loadedNews)
-                var finalItems = mixedList
-                if let weather = self.items.first(where: { $0.sourceName == "Local Weather" }) {
-                    finalItems.insert(weather, at: 0)
-                }
-
-                self.setItems(Array(finalItems.prefix(maxVisibleItems)))
-
-                // Lazy OG image enrichment (does not block UI)
-                self.enqueueOGEnrichment(for: self.items)
-
-                // ✅ Schedule sentiment again (cheap; cache prevents waste)
-                scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: 6)
-
-                self.debugPrintState(phase: "batch-merge")
+            } else {
+                rebuildVisibleItemsFromLoadedNews()
             }
         }
 
-        // ✅ Kick off trends after the main refresh work completes (still non-blocking)
         kickOffTrendsIfNeeded(force: forceNetwork, reason: forceNetwork ? "post-network-refresh" : "post-soft-refresh")
+        maybeEnqueueOGEnrichment()
 
-        debugPrintState(phase: "post-load")
         refreshTask = nil
     }
 
-    // MARK: - AI News Sentiment (Responses API)
-    private func scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: Double, force: Bool = false) {
-        sentimentTask?.cancel()
-        sentimentTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-            await self.refreshNewsSentimentIfNeeded(force: force)
+    // MARK: - Network fetch (Progressive / News-First)
+    private struct FetchResult {
+        let category: String
+        let name: String
+        let url: String
+        let topicName: String
+        let count: Int
+        let status: Int?
+        let contentType: String?
+        let bytes: Int
+    }
+    
+    private struct SourceConfig {
+        let source: FeedSource
+        let type: TickerType
+        let topicName: String
+    }
+
+    private func fetchAndCacheNetworkProgressive() async {
+        dumpConfigurationIfNeeded(reason: "pre-network-fetch")
+
+        let enabledSources = self.sources.filter { self.isEnabled($0) }
+        let showPredictions = self.boolDefaultTrue("showPredictions")
+
+        let customFeeds: [CustomFeed] = {
+            let raw = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
+            return (CustomFeedStorage(rawValue: raw)?.feeds ?? [])
+        }()
+
+        // Map enabled custom feeds
+        var activeCustomFeeds: [CustomFeed] = []
+        for c in customFeeds {
+            let key = "custom_enabled_\(c.id.uuidString)"
+            if (UserDefaults.standard.object(forKey: key) == nil) ? true : UserDefaults.standard.bool(forKey: key) {
+                activeCustomFeeds.append(c)
+            }
+        }
+
+        // Build list of all fetch jobs
+        var newsJobs: [SourceConfig] = []
+        var otherJobs: [SourceConfig] = []
+
+        // 1. Built-in sources
+        for s in enabledSources {
+            let config = SourceConfig(source: s, type: .news, topicName: s.category.uppercased())
+            if s.category.uppercased() == "NEWS" {
+                newsJobs.append(config)
+            } else {
+                otherJobs.append(config)
+            }
+        }
+
+        // 2. Predictions
+        if showPredictions {
+            for s in predictionSources {
+                otherJobs.append(SourceConfig(source: s, type: .prediction, topicName: "FUTURE"))
+            }
+        }
+
+        // 3. Custom feeds
+        for c in activeCustomFeeds {
+            let s = FeedSource(name: c.name, url: c.url, domain: c.domain, defaultEnabled: true, category: "Custom")
+            otherJobs.append(SourceConfig(source: s, type: .news, topicName: c.name))
+        }
+
+        // Shared dedupe state across phases
+        var dedupe: [TickerKey: TickerItem] = [:]
+        dedupe.reserveCapacity(2000)
+        
+        let maxAgeDaysLocal = self.maxItemAgeDays
+        let fetcherLocal = self.fetcher
+
+        // --- PHASE 1: NEWS ---
+        if !newsJobs.isEmpty {
+            dbg("PROGRESSIVE: Phase 1 - Fetching \(newsJobs.count) NEWS sources", level: .info)
+            let newsItems = await fetchBatch(jobs: newsJobs, fetcher: fetcherLocal, maxAgeDays: maxAgeDaysLocal)
+            
+            // Dedupe & Update
+            for item in newsItems {
+                let k = TickerKey(item)
+                dedupe[k] = item
+            }
+            
+            self.allFeedItems = Array(dedupe.values)
+            rebuildLoadedAndVisible()
+            
+            // Immediate Sentiment Trigger using the newly loaded news
+            if !loadedNews.isEmpty {
+                dbg("PROGRESSIVE: News loaded, triggering sentiment immediately.", level: .info)
+                scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: 0.5, force: true)
+            }
+        }
+
+        // --- PHASE 2: OTHERS ---
+        if !otherJobs.isEmpty {
+            dbg("PROGRESSIVE: Phase 2 - Fetching \(otherJobs.count) OTHER sources", level: .info)
+            let otherItems = await fetchBatch(jobs: otherJobs, fetcher: fetcherLocal, maxAgeDays: maxAgeDaysLocal)
+            
+            // Dedupe & Update
+            for item in otherItems {
+                let k = TickerKey(item)
+                if let existing = dedupe[k] {
+                    // Prefer item with media if existing has none
+                    if existing.mediaURL == nil && item.mediaURL != nil {
+                        dedupe[k] = item
+                    }
+                } else {
+                    dedupe[k] = item
+                }
+            }
+            
+            self.allFeedItems = Array(dedupe.values)
+            rebuildLoadedAndVisible()
+        }
+        
+        // --- PHASE 3: TRENDS ---
+        kickOffTrendsIfNeeded(force: true, reason: "post-network-refresh")
+    }
+    
+    private func fetchBatch(jobs: [SourceConfig], fetcher: FeedFetcher, maxAgeDays: Int) async -> [TickerItem] {
+        await withTaskGroup(of: [TickerItem].self) { group in
+            for job in jobs {
+                group.addTask {
+                    let (batch, _) = await fetcher.fetchRSSWithMeta(
+                        source: job.source,
+                        type: job.type,
+                        topicName: job.topicName,
+                        forceNetwork: true
+                    )
+                    
+                    let now = Date()
+                    return batch.filter { !Staleness.isStale($0.publishedAt, maxDays: maxAgeDays, now: now) }
+                }
+            }
+            
+            var results: [TickerItem] = []
+            for await batch in group {
+                results.append(contentsOf: batch)
+            }
+            return results
         }
     }
 
-    private func refreshNewsSentimentIfNeeded(force: Bool = false) async {
-        let todayKey = Self.dayKey(Date())
-        if !force, sentimentCacheDayKey == todayKey, newsSentiment != nil {
-            print("🤖 Sentiment skip: cached for \(todayKey)")
-            return
-        }
+    // MARK: - Loaded rebuild
+    private func rebuildLoadedAndVisible() {
+        let showTrends = boolDefaultTrue("showTrends")
+        let merged = allFeedItems + (showTrends ? trendItems : [])
 
-        let todays = todaysNewsHeadlines(limit: 40)
-        print("🤖 Sentiment headlines today: \(todays.count) (force=\(force))")
-
-        guard !todays.isEmpty else {
-            print("🤖 Sentiment abort: no 'today' NEWS headlines yet")
-            return
-        }
-
-        if isComputingSentiment {
-            print("🤖 Sentiment skip: already computing")
-            return
-        }
-
-        isComputingSentiment = true
-        defer { isComputingSentiment = false }
-
-        do {
-            let result = try await OpenAIService.classifySentimentAndSummarize(
-                session: self.session,
-                apiKey: Secrets.openAIKey,
-                headlines: todays
-            )
-            self.newsSentiment = result
-            self.sentimentCacheDayKey = todayKey
-            print("✅ Sentiment OK: \(result.level.rawValue) | \(result.threeWordSummary)")
-        } catch {
-            print("❌ Sentiment error: \(error.localizedDescription)")
-        }
-    }
-
-    private func todaysNewsHeadlines(limit: Int) -> [String] {
-        let cal = Calendar.current
         let now = Date()
+        let recency = merged.filter { !Staleness.isStale($0.publishedAt, maxDays: maxItemAgeDays, now: now) }
 
-        let filtered = items.filter { item in
-            guard (item.value ?? "") == "NEWS" else { return false }
-            guard let d = item.publishedAt else { return false }
-            guard cal.isDate(d, inSameDayAs: now) else { return false }
-            return true
-        }
-
-        var seen = Set<String>()
-        let unique = filtered.compactMap { it -> String? in
-            let t = it.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !t.isEmpty else { return nil }
-            if seen.contains(t) { return nil }
-            seen.insert(t)
-            return t
-        }
-
-        return Array(unique.prefix(limit))
+        loadedNews = pruneDisabled(from: recency)
+        rebuildVisibleItemsFromLoadedNews()
     }
 
-    private static func dayKey(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone.current
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: d)
+    private func pruneDisabled(from items: [TickerItem]) -> [TickerItem] {
+        let enabledSources = sources.filter { isEnabled($0) }
+        let disabledSources = sources.filter { !isEnabled($0) }
+
+        let disabledNewsNames = Set(disabledSources.filter { $0.category.lowercased() == "news" }.map { $0.name })
+
+        let enabledBuiltInCategories: Set<String> = Set(
+            enabledSources
+                .filter { $0.category.lowercased() != "news" }
+                .map { $0.category.uppercased() }
+        )
+
+        let showTrends = boolDefaultTrue("showTrends")
+        let showPredictions = boolDefaultTrue("showPredictions")
+
+        var enabledCustomNames: Set<String> = []
+        let customData = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
+        if let storage = CustomFeedStorage(rawValue: customData) {
+            for feed in storage.feeds {
+                let key = "custom_enabled_\(feed.id.uuidString)"
+                if boolDefaultTrue(key) { enabledCustomNames.insert(feed.name) }
+            }
+        }
+
+        return items.filter { item in
+            if item.sourceName == "Local Weather" { return true }
+
+            let val = (item.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let up = val.uppercased()
+
+            if item.sourceName == "Global Market Trends" || up == "TRENDS" { return showTrends }
+            if up == "FUTURE" { return showPredictions }
+            if up == "NEWS" { return !disabledNewsNames.contains(item.sourceName) }
+            if enabledBuiltInCategories.contains(up) { return true }
+            if enabledCustomNames.contains(val) { return true }
+
+            return false
+        }
     }
 
-    // MARK: - Trends (separate process/task, throttled)
+    // MARK: - Trends
+    private func normalizeTrendItems(_ items: [TickerItem]) -> [TickerItem] {
+        items.map { it in
+            TickerItem(
+                text: it.text,
+                type: .news,
+                value: "TRENDS",
+                score: it.score,
+                sourceDomain: it.sourceDomain,
+                sourceName: "Global Market Trends",
+                mediaURL: it.mediaURL,
+                isVideo: it.isVideo,
+                articleURL: it.articleURL,
+                publishedAt: it.publishedAt ?? Date()
+            )
+        }
+    }
+
     private func kickOffTrendsIfNeeded(force: Bool, reason: String) {
-        let showTrends = UserDefaults.standard.object(forKey: "showTrends") == nil
-            ? true
-            : UserDefaults.standard.bool(forKey: "showTrends")
+        let showTrends = boolDefaultTrue("showTrends")
 
         guard showTrends else {
-            print("📈 Trends skipped (\(reason)): disabled in settings")
             trendsTask?.cancel()
             trendsTask = nil
-            removeExistingTrendsFromCache()
+            trendItems.removeAll()
+            rebuildLoadedAndVisible()
+            dbg("TRENDS: skipped (\(reason)) disabled", level: .info)
             return
         }
 
         if !force, let last = lastTrendsRefreshAt, Date().timeIntervalSince(last) < trendsMinIntervalSeconds {
-            let remaining = Int(trendsMinIntervalSeconds - Date().timeIntervalSince(last))
-            print("📈 Trends throttled (\(reason)): next allowed in ~\(max(0, remaining))s")
+            dbg("TRENDS: throttled (\(reason)) last=\(last)", level: .info)
             return
         }
 
         if trendsTask != nil {
-            print("📈 Trends already running (\(reason))")
+            dbg("TRENDS: already running (\(reason))", level: .info)
             return
         }
 
-        print("📈 Trends kickoff (\(reason))… (force=\(force))")
+        dbg("TRENDS: kickoff (\(reason)) force=\(force)", level: .info)
 
         trendsTask = Task { [weak self] in
             guard let self else { return }
@@ -547,138 +922,186 @@ class FeedManager: NSObject, ObservableObject {
             if Task.isCancelled { return }
 
             do {
-                print("🐍 Trends fetch start (python) (\(reason))")
-                let trendItems = try await self.fetchTrendsOffMain()
+                let incoming = try await self.trendProvider.fetchGlobalTrends()
                 if Task.isCancelled { return }
 
-                await MainActor.run {
-                    self.lastTrendsRefreshAt = Date()
-                    self.mergeTrendsIntoCache(trendItems)
-                    print("✅ Trends fetch OK (\(reason)): \(trendItems.count) items")
-                    self.debugPrintState(phase: "trends-merge (\(reason))")
-                    self.trendsTask = nil
-                }
+                let normalized = self.normalizeTrendItems(incoming)
+                let now = Date()
+                let fresh = normalized.filter { !Staleness.isStale($0.publishedAt, maxDays: self.maxItemAgeDays, now: now) }
+
+                self.trendItems = fresh
+                self.lastTrendsRefreshAt = Date()
+
+                self.rebuildLoadedAndVisible()
+                self.trendsTask = nil
             } catch {
-                await MainActor.run {
-                    print("❌ Trends fetch failed (\(reason)): \(error)")
-                    self.trendsTask = nil
-                }
+                self.dbg("❌ Trends fetch failed (\(reason)): \(error)", level: .error)
+                self.trendsTask = nil
             }
         }
     }
 
-    private func fetchTrendsOffMain() async throws -> [TickerItem] {
-        let provider = self.trendProvider
+    // MARK: - MIXER
+    private func mixFeeds(_ items: [TickerItem]) -> [TickerItem] {
+        let desired = maxVisibleItems
 
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                Task {
-                    do {
-                        let items = try await provider.fetchGlobalTrends()
-                        continuation.resume(returning: items)
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
-                }
-            }
-        }
-    }
+        let trendsEveryN = 4
+        let trendsBoostAtStart = 2
 
-    private func removeExistingTrendsFromCache() {
-        loadedNews = setFilter(loadedNews) { $0.sourceName != "Global Market Trends" }
+        let newsMaxFraction: Double = 0.22
+        let futureMaxFraction: Double = 0.22
 
-        let mixedList = mixFeeds(loadedNews)
-        if let weather = items.first(where: { $0.sourceName == "Local Weather" }) {
-            setItems([weather] + Array(mixedList.prefix(maxVisibleItems - 1)))
-        } else {
-            setItems(Array(mixedList.prefix(maxVisibleItems)))
-        }
-    }
-
-    private func mergeTrendsIntoCache(_ incoming: [TickerItem]) {
-        loadedNews = setFilter(loadedNews) { $0.sourceName != "Global Market Trends" }
-
-        let fresh = incoming.filter { !$0.isStale(maxDays: maxItemAgeDays) }
-        if !fresh.isEmpty {
-            loadedNews.formUnion(fresh)
-        }
-
-        loadedNews = setPrunedByRecency(loadedNews)
-
-        let mixedList = mixFeeds(loadedNews)
-        var finalItems = mixedList
-        if let weather = items.first(where: { $0.sourceName == "Local Weather" }) {
-            finalItems.insert(weather, at: 0)
-        }
-
-        setItems(Array(finalItems.prefix(maxVisibleItems)))
-        enqueueOGEnrichment(for: items)
-    }
-
-    // MARK: - MIXER (Trends priority)
-    private func mixFeeds(_ items: Set<TickerItem>) -> [TickerItem] {
-        var topics: [TickerItem] = []
-        var future: [TickerItem] = []
-        var news: [TickerItem] = []
         var trends: [TickerItem] = []
+        var byTopic: [String: [TickerItem]] = [:]
 
         for item in items {
             if item.sourceName == "Local Weather" { continue }
 
-            let val = item.value ?? ""
-            if item.sourceName == "Global Market Trends" {
+            let v = (item.value ?? "").uppercased()
+            if item.sourceName == "Global Market Trends" || v == "TRENDS" {
                 trends.append(item)
-            } else if val == "NEWS" {
-                news.append(item)
-            } else if val == "FUTURE" {
-                future.append(item)
-            } else {
-                topics.append(item)
+                continue
+            }
+
+            let topic = (item.value ?? "UNKNOWN").trimmingCharacters(in: .whitespacesAndNewlines)
+            byTopic[topic, default: []].append(item)
+        }
+
+        var mixedByTopic: [String: [TickerItem]] = [:]
+        mixedByTopic.reserveCapacity(byTopic.count)
+
+        for (topic, arr) in byTopic {
+            mixedByTopic[topic] = roundRobinBySource(arr, maxPerSource: maxPerSourcePerCategory)
+        }
+
+        let mixedTrends = roundRobinBySource(trends, maxPerSource: maxPerSourcePerCategory)
+        let topics = Array(mixedByTopic.keys)
+
+        func priority(_ t: String) -> Int {
+            switch t.uppercased() {
+            case "NEWS": return 1
+            case "FUTURE": return 2
+            default: return 3
             }
         }
 
-        let mixedTopics = roundRobinBySource(topics, maxPerSource: maxPerSourcePerCategory)
-        let mixedFuture = roundRobinBySource(future, maxPerSource: maxPerSourcePerCategory)
-        let mixedNews = roundRobinBySource(news, maxPerSource: maxPerSourcePerCategory)
-        let mixedTrends = roundRobinBySource(trends, maxPerSource: maxPerSourcePerCategory)
-
-        var result: [TickerItem] = []
-        var tIndex = 0, fIndex = 0, nIndex = 0, trIndex = 0
-
-        // Trends priority interleave:
-        // Trends -> Topic -> Trends -> Future -> News
-        while tIndex < mixedTopics.count || trIndex < mixedTrends.count || fIndex < mixedFuture.count || nIndex < mixedNews.count {
-            if trIndex < mixedTrends.count { result.append(mixedTrends[trIndex]); trIndex += 1 }
-            if tIndex < mixedTopics.count { result.append(mixedTopics[tIndex]); tIndex += 1 }
-            if trIndex < mixedTrends.count { result.append(mixedTrends[trIndex]); trIndex += 1 }
-            if fIndex < mixedFuture.count { result.append(mixedFuture[fIndex]); fIndex += 1 }
-            if nIndex < mixedNews.count { result.append(mixedNews[nIndex]); nIndex += 1 }
+        var topicOrder = topics.sorted { a, b in
+            let pa = priority(a), pb = priority(b)
+            if pa != pb { return pa > pb }
+            return a < b
         }
 
-        return result
+        // custom first, then future, then news
+        let custom = topicOrder.filter { priority($0) == 3 }.shuffled()
+        let future = topicOrder.filter { $0.uppercased() == "FUTURE" }
+        let news = topicOrder.filter { $0.uppercased() == "NEWS" }
+        topicOrder = custom + future + news
+
+        var idxByTopic: [String: Int] = [:]
+        for t in mixedByTopic.keys { idxByTopic[t] = 0 }
+
+        let maxNews = Int(Double(desired) * newsMaxFraction)
+        let maxFuture = Int(Double(desired) * futureMaxFraction)
+        var usedNews = 0
+        var usedFuture = 0
+
+        func canTake(_ t: String) -> Bool {
+            let up = t.uppercased()
+            if up == "NEWS" { return usedNews < maxNews }
+            if up == "FUTURE" { return usedFuture < maxFuture }
+            return true
+        }
+
+        func record(_ t: String) {
+            let up = t.uppercased()
+            if up == "NEWS" { usedNews += 1 }
+            if up == "FUTURE" { usedFuture += 1 }
+        }
+
+        var out: [TickerItem] = []
+        out.reserveCapacity(desired)
+
+        var trendIndex = 0
+        var sinceTrend = 999
+
+        if !mixedTrends.isEmpty {
+            let take = min(trendsBoostAtStart, mixedTrends.count)
+            for i in 0..<take {
+                out.append(mixedTrends[i])
+                trendIndex = i + 1
+            }
+            sinceTrend = 0
+        }
+
+        while out.count < desired {
+            var progressed = false
+
+            if trendIndex < mixedTrends.count, sinceTrend >= trendsEveryN {
+                out.append(mixedTrends[trendIndex])
+                trendIndex += 1
+                sinceTrend = 0
+                progressed = true
+                if out.count >= desired { break }
+            }
+
+            for topic in topicOrder {
+                guard canTake(topic) else { continue }
+                guard let arr = mixedByTopic[topic], !arr.isEmpty else { continue }
+
+                let i = idxByTopic[topic] ?? 0
+                guard i < arr.count else { continue }
+
+                out.append(arr[i])
+                idxByTopic[topic] = i + 1
+                record(topic)
+
+                sinceTrend += 1
+                progressed = true
+                if out.count >= desired { break }
+
+                if trendIndex < mixedTrends.count, sinceTrend >= trendsEveryN {
+                    out.append(mixedTrends[trendIndex])
+                    trendIndex += 1
+                    sinceTrend = 0
+                    if out.count >= desired { break }
+                }
+            }
+
+            if !progressed { break }
+        }
+
+        if out.count < desired {
+            var remainder: [TickerItem] = []
+            for (topic, arr) in mixedByTopic {
+                let start = idxByTopic[topic] ?? 0
+                if start < arr.count { remainder.append(contentsOf: arr[start...]) }
+            }
+
+            remainder.sort { ($0.publishedAt ?? .distantPast) > ($1.publishedAt ?? .distantPast) }
+            for item in remainder where out.count < desired { out.append(item) }
+
+            while out.count < desired, trendIndex < mixedTrends.count {
+                out.append(mixedTrends[trendIndex])
+                trendIndex += 1
+            }
+        }
+
+        return out
     }
 
     private func roundRobinBySource(_ items: [TickerItem], maxPerSource: Int) -> [TickerItem] {
         guard !items.isEmpty else { return [] }
 
         var grouped = Dictionary(grouping: items, by: { $0.sourceName })
-
         for key in grouped.keys {
-            grouped[key]?.sort { a, b in
-                let da = a.publishedAt ?? .distantPast
-                let db = b.publishedAt ?? .distantPast
-                return da > db
-            }
-            if let capped = grouped[key]?.prefix(maxPerSource) {
-                grouped[key] = Array(capped)
-            }
+            grouped[key]?.sort { ($0.publishedAt ?? .distantPast) > ($1.publishedAt ?? .distantPast) }
+            if let capped = grouped[key]?.prefix(maxPerSource) { grouped[key] = Array(capped) }
         }
 
         var sourceKeys = Array(grouped.keys)
         sourceKeys.shuffle()
 
         var indices: [String: Int] = [:]
-        indices.reserveCapacity(sourceKeys.count)
         for k in sourceKeys { indices[k] = 0 }
 
         var out: [TickerItem] = []
@@ -698,134 +1121,13 @@ class FeedManager: NSObject, ObservableObject {
         return out
     }
 
-    // MARK: - FILTERING
-    private func pruneDisabledItems() {
-        let disabledNewsNames = Set(sources.filter { !isEnabled($0) }.map { $0.name })
-        let showTrends = UserDefaults.standard.object(forKey: "showTrends") == nil ? true : UserDefaults.standard.bool(forKey: "showTrends")
-        let showPredictions = UserDefaults.standard.object(forKey: "showPredictions") == nil ? true : UserDefaults.standard.bool(forKey: "showPredictions")
-
-        var validCustomNames: Set<String> = []
-        let customData = UserDefaults.standard.string(forKey: "customFeeds") ?? "[]"
-        if let storage = CustomFeedStorage(rawValue: customData) {
-            for feed in storage.feeds {
-                let key = "custom_enabled_\(feed.id.uuidString)"
-                if (UserDefaults.standard.object(forKey: key) == nil ? true : UserDefaults.standard.bool(forKey: key)) {
-                    validCustomNames.insert(feed.name)
-                }
-            }
-        }
-
-        loadedNews = setPrunedByRecency(loadedNews)
-
-        loadedNews = setFilter(loadedNews) { item in
-            if item.sourceName == "Local Weather" { return true }
-
-            let val = item.value ?? ""
-
-            if item.sourceName == "Global Market Trends" {
-                return showTrends
-            }
-            if val == "FUTURE" {
-                return showPredictions
-            }
-
-            if val == "NEWS" {
-                return !disabledNewsNames.contains(item.sourceName)
-            }
-
-            return validCustomNames.contains(val)
-        }
-
+    private func rebuildVisibleItemsFromLoadedNews() {
         let mixed = mixFeeds(loadedNews)
         if let weather = items.first(where: { $0.sourceName == "Local Weather" }) {
-            setItems([weather] + Array(mixed.prefix(maxVisibleItems - 1)))
+            setItems([weather] + Array(mixed.prefix(max(0, maxVisibleItems - 1))))
         } else {
             setItems(Array(mixed.prefix(maxVisibleItems)))
         }
-
-        debugPrintState(phase: "prune", disabledNews: disabledNewsNames, trends: showTrends, future: showPredictions, custom: validCustomNames)
-
-        if !showTrends {
-            trendsTask?.cancel()
-            trendsTask = nil
-            removeExistingTrendsFromCache()
-        }
-    }
-
-    private func debugPrintState(
-        phase: String,
-        disabledNews: Set<String>? = nil,
-        trends: Bool? = nil,
-        future: Bool? = nil,
-        custom: Set<String>? = nil
-    ) {
-        let pruned = setPrunedByRecency(loadedNews)
-        let staleCount = loadedNews.count - pruned.count
-
-        print("------- FEED MANAGER DEBUG -------")
-        print("🧭 Phase: \(phase)")
-        if let t = trends { print("📈 Show Trends: \(t)") }
-        if let f = future { print("🔮 Show Future: \(f)") }
-        print("🧹 Recency prune: -\(staleCount) (>\(self.maxItemAgeDays)d)")
-        print("📦 CACHE STATS: \(pruned.count) items (raw: \(loadedNews.count))")
-        print("🧾 VISIBLE ITEMS: \(items.count) (rev=\(itemsRevision))")
-
-        let counts = Dictionary(grouping: pruned, by: { $0.sourceName })
-        for (key, value) in counts {
-            print("   - \(key): \(value.count) items")
-        }
-        print("----------------------------------")
-    }
-
-    // MARK: - Helpers (Set-safe filtering)
-    private func setFilter(_ set: Set<TickerItem>, include: (TickerItem) -> Bool) -> Set<TickerItem> {
-        var out = Set<TickerItem>()
-        out.reserveCapacity(set.count)
-        for item in set where include(item) {
-            out.insert(item)
-        }
-        return out
-    }
-
-    private func setPrunedByRecency(_ set: Set<TickerItem>) -> Set<TickerItem> {
-        return setFilter(set) { !$0.isStale(maxDays: self.maxItemAgeDays) }
-    }
-
-    private func isEnabled(_ source: FeedSource) -> Bool {
-        return UserDefaults.standard.object(forKey: source.settingKey) == nil
-            ? source.defaultEnabled
-            : UserDefaults.standard.bool(forKey: source.settingKey)
-    }
-
-    // IMPORTANT: use URLRequest so headers apply
-    private func fetchRSS(source: FeedSource, type: TickerType, topicName: String, forceNetwork: Bool) async -> [TickerItem] {
-        guard let url = URL(string: source.url) else { return [] }
-
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 12.0
-            request.cachePolicy = forceNetwork ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
-            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue(acceptHeader, forHTTPHeaderField: "Accept")
-            request.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
-
-            let (data, response) = try await self.session.data(for: request)
-
-            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                print("❌ RSS HTTP \(http.statusCode) for \(source.name) (\(source.url))")
-                return []
-            }
-
-            return await parseXMLInBackground(data: data, source: source, type: type, topicName: topicName)
-        } catch {
-            print("❌ RSS fetch error for \(source.name): \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    nonisolated private func parseXMLInBackground(data: Data, source: FeedSource, type: TickerType, topicName: String) async -> [TickerItem] {
-        let parser = RSSParser(data: data, source: source, type: type, topicName: topicName, maxAgeDays: maxItemAgeDays)
-        return parser.parse()
     }
 
     // MARK: - Weather
@@ -859,7 +1161,7 @@ class FeedManager: NSObject, ObservableObject {
                 type: .news,
                 value: "Weather",
                 score: nil,
-                sourceDomain: "meteo.com",
+                sourceDomain: "open-meteo.com",
                 sourceName: "Local Weather",
                 mediaURL: nil,
                 isVideo: false,
@@ -872,16 +1174,19 @@ class FeedManager: NSObject, ObservableObject {
     }
 
     private func withTimeout<T>(seconds: TimeInterval, operation: @escaping @Sendable () async -> T?) async -> T? {
-        return await withTaskGroup(of: T?.self) { group in
+        await withTaskGroup(of: T?.self) { group in
             group.addTask { await operation() }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 return nil
             }
-            return await group.next() ?? nil
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
         }
     }
-
+    
+    // Note: kept minimal usage of CoreLocation for geocoding
     private func geocodeCity(_ city: String) async -> CLLocation? {
         let trimmed = city.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return nil }
@@ -893,634 +1198,198 @@ class FeedManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Lazy OG image enrichment
+    // MARK: - OG enrichment (capped)
+    private func maybeEnqueueOGEnrichment() {
+        if let last = lastOGEnrichAt, Date().timeIntervalSince(last) < 120 { return }
+        lastOGEnrichAt = Date()
+
+        let candidates = items
+            .filter { $0.mediaURL == nil }
+            .filter { $0.sourceName != "Local Weather" && $0.sourceName != "Global Market Trends" && $0.sourceName != "SYSTEM" }
+
+        enqueueOGEnrichment(for: Array(candidates.prefix(40)))
+    }
+
     private func enqueueOGEnrichment(for items: [TickerItem]) {
+        var seen = Set<URL>()
         for item in items {
-            guard item.mediaURL == nil else { continue }
-            guard item.sourceName != "Local Weather" else { continue }
-            guard item.sourceName != "Global Market Trends" else { continue }
+            let u = item.articleURL
+            if seen.contains(u) { continue }
+            seen.insert(u)
 
             ogEnricher.enqueue(item: item) { [weak self] updated in
                 guard let self else { return }
-                Task { @MainActor in
-                    self.applyEnrichedItem(updated)
-                }
+                Task { @MainActor in self.applyEnrichedItem(updated) }
             }
         }
     }
 
-    @MainActor
     private func applyEnrichedItem(_ updated: TickerItem) {
-        if let idx = items.firstIndex(where: { $0 == updated }) {
+        if let idx = items.firstIndex(where: { TickerKey($0) == TickerKey(updated) }) {
             items[idx] = updated
             itemsRevision &+= 1
         }
 
-        if loadedNews.contains(updated) {
-            loadedNews.remove(updated)
-            loadedNews.insert(updated)
-        }
-    }
-
-    // MARK: - Feed health check
-    private enum FeedHealthStatus {
-        case ok
-        case badHTTP(Int)
-        case emptyOrUnparseable
-        case error(String)
-    }
-
-    private struct FeedHealthResult {
-        let source: FeedSource
-        let status: FeedHealthStatus
-    }
-
-    private func checkFeedHealth(_ source: FeedSource) async -> FeedHealthResult {
-        guard let url = URL(string: source.url) else {
-            return FeedHealthResult(source: source, status: .error("Bad URL"))
-        }
-
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 10.0
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue(acceptHeader, forHTTPHeaderField: "Accept")
-            request.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
-
-            let (data, response) = try await self.session.data(for: request)
-
-            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                return FeedHealthResult(source: source, status: .badHTTP(http.statusCode))
+        func replace(in arr: inout [TickerItem]) {
+            if let i = arr.firstIndex(where: { TickerKey($0) == TickerKey(updated) }) {
+                arr[i] = updated
             }
+        }
+        replace(in: &allFeedItems)
+        replace(in: &trendItems)
+        replace(in: &loadedNews)
+    }
 
-            let parsed = await parseXMLInBackground(data: data, source: source, type: .news, topicName: "HEALTH")
-            if parsed.isEmpty {
-                return FeedHealthResult(source: source, status: .emptyOrUnparseable)
-            }
-
-            return FeedHealthResult(source: source, status: .ok)
-        } catch {
-            return FeedHealthResult(source: source, status: .error(error.localizedDescription))
+    // MARK: - Health check
+    func runHealthCheckNow() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.runFeedHealthCheck(reason: "manual")
         }
     }
+
+    private enum FeedHealthStatus { case ok, badHTTP(Int), emptyOrUnparseable, error(String) }
+    private struct FeedHealthResult { let source: FeedSource; let status: FeedHealthStatus }
 
     private func runFeedHealthCheck(reason: String) async {
         if isRunningHealthCheck { return }
         isRunningHealthCheck = true
         defer { isRunningHealthCheck = false }
 
-        let toCheck = self.sources.filter { self.isEnabled($0) }
-        guard !toCheck.isEmpty else {
+        let enabled = self.sources.filter { self.isEnabled($0) }
+        guard !enabled.isEmpty else {
             lastHealthCheckSummary = "No enabled feeds to check."
             return
         }
 
-        print("🩺 Feed health check (\(reason)) starting: \(toCheck.count) enabled feeds…")
+        dbg("HEALTHCHECK: starting (\(reason)) enabledFeeds=\(enabled.count)", level: .info)
 
-        let maxConcurrent = 8
+        let fetcherLocal = self.fetcher
+
+        func check(_ source: FeedSource) async -> FeedHealthResult {
+            let (items, meta) = await fetcherLocal.fetchRSSWithMeta(
+                source: source,
+                type: .news,
+                topicName: "HEALTH",
+                forceNetwork: true
+            )
+
+            if let code = meta.statusCode, !(200...299).contains(code) {
+                return FeedHealthResult(source: source, status: .badHTTP(code))
+            }
+            if items.isEmpty {
+                return FeedHealthResult(source: source, status: .emptyOrUnparseable)
+            }
+            return FeedHealthResult(source: source, status: .ok)
+        }
+
+        let maxConcurrent = 6
         var failures: [FeedHealthResult] = []
 
         var idx = 0
-        while idx < toCheck.count {
-            let chunk = Array(toCheck[idx..<min(idx + maxConcurrent, toCheck.count)])
+        while idx < enabled.count {
+            let chunk = Array(enabled[idx..<min(idx + maxConcurrent, enabled.count)])
             idx += chunk.count
 
             await withTaskGroup(of: FeedHealthResult.self) { group in
-                for src in chunk {
-                    group.addTask { await self.checkFeedHealth(src) }
-                }
+                for src in chunk { group.addTask { await check(src) } }
                 for await result in group {
                     switch result.status {
-                    case .ok:
-                        break
-                    default:
-                        failures.append(result)
+                    case .ok: break
+                    default: failures.append(result)
                     }
                 }
             }
         }
 
         if failures.isEmpty {
-            lastHealthCheckSummary = "Health check OK. \(toCheck.count) feeds."
-            print("✅ Feed health check OK")
+            lastHealthCheckSummary = "Health check OK. \(enabled.count) feeds."
+            dbg("HEALTHCHECK: OK", level: .info)
             return
         }
 
+        dbg("HEALTHCHECK: disabling \(failures.count) dead feeds", level: .info)
         for f in failures {
-            let name = f.source.name
-            let url = f.source.url
-
             switch f.status {
-            case .badHTTP(let code):
-                print("   - ❌ \(name) (HTTP \(code)) \(url)")
-            case .emptyOrUnparseable:
-                print("   - ❌ \(name) (empty/unparseable) \(url)")
-            case .error(let msg):
-                print("   - ❌ \(name) (error: \(msg)) \(url)")
-            case .ok:
-                break
+            case .badHTTP(let code): dbg("  - ❌ \(f.source.name) HTTP \(code) \(f.source.url)", level: .info)
+            case .emptyOrUnparseable: dbg("  - ❌ \(f.source.name) empty/unparseable \(f.source.url)", level: .info)
+            case .error(let msg): dbg("  - ❌ \(f.source.name) error \(msg) \(f.source.url)", level: .info)
+            case .ok: break
             }
-
             UserDefaults.standard.set(false, forKey: f.source.settingKey)
         }
 
         lastHealthCheckSummary = "Disabled \(failures.count) dead feeds."
-        pruneDisabledItems()
+        rebuildLoadedAndVisible()
         softRefresh()
     }
-}
 
-// MARK: - OpenAI (Responses API) helper
-private enum OpenAIService {
-    private struct SentimentResponse: Codable {
-        let level: String
-        let threeWordSummary: String
-    }
-
-    static func classifySentimentAndSummarize(
-        session: URLSession,
-        apiKey: String,
-        headlines: [String]
-    ) async throws -> FeedManager.NewsSentiment {
-        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "openai", code: 401, userInfo: [NSLocalizedDescriptionKey: "Missing API key"])
-        }
-
-        let url = URL(string: "https://api.openai.com/v1/responses")!
-
-        // Keep prompt extremely tight to reduce latency + token spend
-        let joined = headlines.prefix(40).map { "• \($0)" }.joined(separator: "\n")
-
-        let instructions =
-"""
-You are classifying the overall sentiment of today's news headlines.
-Return STRICT JSON only (no markdown, no extra text).
-Schema:
-{"level":"green|amber|red","threeWordSummary":"exactly three words"}
-Rules:
-- green = broadly positive
-- amber = mixed/uncertain/neutral
-- red = broadly negative
-- threeWordSummary MUST be exactly 3 words, Title Case, no punctuation.
-"""
-
-        // Try gpt-5.2 first (your preference), then fallbacks
-        let modelCandidates = ["gpt-5.2", "gpt-4.1-mini", "gpt-4o-mini", "gpt-4o"]
-
-        var lastError: Error?
-
-        for model in modelCandidates {
-            do {
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.timeoutInterval = 18.0
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-                let body: [String: Any] = [
-                    "model": model,
-                    "instructions": instructions,
-                    "input": "HEADLINES (today only):\n\(joined)"
-                ]
-
-                request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
-
-                print("🤖 OpenAI request: model=\(model), headlines=\(min(40, headlines.count))")
-
-                let (data, response) = try await session.data(for: request)
-
-                if let http = response as? HTTPURLResponse {
-                    let reqId = http.value(forHTTPHeaderField: "x-request-id") ?? "n/a"
-                    print("🤖 OpenAI HTTP \(http.statusCode) (request-id: \(reqId)) model=\(model)")
-                    if !(200...299).contains(http.statusCode) {
-                        let snippet = String(data: data, encoding: .utf8) ?? ""
-                        print("🤖 OpenAI error body (first 800 chars):\n\(snippet.prefix(800))")
-                        throw NSError(
-                            domain: "openai",
-                            code: http.statusCode,
-                            userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(snippet.prefix(240))"]
-                        )
-                    }
-                }
-
-                let payloadAny = try JSONSerialization.jsonObject(with: data, options: [])
-                if let dict = payloadAny as? [String: Any] {
-                    print("🤖 OpenAI payload keys: \(Array(dict.keys).sorted()) model=\(model)")
-                }
-
-                let payloadData = try JSONSerialization.data(withJSONObject: payloadAny, options: [.prettyPrinted])
-                let payloadString = String(data: payloadData, encoding: .utf8) ?? ""
-                print("🤖 OpenAI payload (first 1200 chars) model=\(model):\n\(payloadString.prefix(1200))")
-
-                if let extractedText = extractTextFromResponsesPayload(payloadAny) {
-                    print("🤖 OpenAI extracted text (first 600) model=\(model):\n\(extractedText.prefix(600))")
-                    if let parsed = parseStrictJSONFromString(extractedText) {
-                        return mapSentiment(parsed)
-                    }
-                }
-
-                // Fallback: try to find a JSON object anywhere
-                if let extracted = extractFirstJSONObject(from: payloadString),
-                   let parsed = parseStrictJSONFromString(extracted) {
-                    return mapSentiment(parsed)
-                }
-
-                throw NSError(domain: "openai", code: 422, userInfo: [NSLocalizedDescriptionKey: "Could not parse sentiment JSON"])
-            } catch {
-                lastError = error
-                print("❌ OpenAI model failed: \(model) error=\(error.localizedDescription)")
-                continue
-            }
-        }
-
-        throw lastError ?? NSError(domain: "openai", code: 500, userInfo: [NSLocalizedDescriptionKey: "Unknown OpenAI error"])
-    }
-
-    private static func extractTextFromResponsesPayload(_ any: Any) -> String? {
-        guard let dict = any as? [String: Any] else { return nil }
-
-        if let t = dict["output_text"] as? String, !t.isEmpty { return t }
-
-        // Common shape: output: [ { content: [ { text: "..." } ] } ]
-        if let output = dict["output"] as? [[String: Any]] {
-            var chunks: [String] = []
-            for o in output {
-                if let content = o["content"] as? [[String: Any]] {
-                    for c in content {
-                        if let text = c["text"] as? String { chunks.append(text) }
-                        else if let t = c["output_text"] as? String { chunks.append(t) }
-                    }
-                }
-            }
-            let joined = chunks.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            return joined.isEmpty ? nil : joined
-        }
-
-        return nil
-    }
-
-    private static func mapSentiment(_ parsed: SentimentResponse) -> FeedManager.NewsSentiment {
-        let levelRaw = parsed.level.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let level: FeedManager.NewsSentiment.Level = {
-            switch levelRaw {
-            case "green": return .green
-            case "amber": return .amber
-            case "red": return .red
-            default: return .amber
-            }
-        }()
-
-        let summary = parsed.threeWordSummary.trimmingCharacters(in: .whitespacesAndNewlines)
-        return FeedManager.NewsSentiment(level: level, threeWordSummary: summary, computedAt: Date())
-    }
-
-    private static func parseStrictJSONFromString(_ s: String) -> SentimentResponse? {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        let candidate = extractFirstJSONObject(from: trimmed) ?? trimmed
-        guard let data = candidate.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(SentimentResponse.self, from: data)
-    }
-
-    private static func extractFirstJSONObject(from text: String) -> String? {
-        guard let start = text.firstIndex(of: "{") else { return nil }
-        var depth = 0
-        var i = start
-        while i < text.endIndex {
-            let ch = text[i]
-            if ch == "{" { depth += 1 }
-            if ch == "}" {
-                depth -= 1
-                if depth == 0 {
-                    let end = text.index(after: i)
-                    return String(text[start..<end])
-                }
-            }
-            i = text.index(after: i)
-        }
-        return nil
-    }
-}
-
-// MARK: - RSS / Atom Parser
-final class RSSParser: NSObject, XMLParserDelegate, @unchecked Sendable {
-    private var parser: XMLParser
-    private let source: FeedSource
-    private let type: TickerType
-    private let topicName: String
-    private let maxAgeDays: Int
-
-    private var items: [TickerItem] = []
-
-    private var currentTag: String = ""
-    private var elementStack: [String] = []
-
-    private var currentTitle: String = ""
-    private var currentLink: String = ""
-    private var currentDescription: String = ""
-    private var currentContentEncoded: String = ""
-
-    private var currentPublishedAt: Date?
-    private var currentDateText: String = ""
-
-    private var imageCandidates: [String] = []
-
-    init(data: Data, source: FeedSource, type: TickerType, topicName: String, maxAgeDays: Int) {
-        self.parser = XMLParser(data: data)
-        self.source = source
-        self.type = type
-        self.topicName = topicName
-        self.maxAgeDays = maxAgeDays
-        super.init()
-        self.parser.delegate = self
-        self.parser.shouldProcessNamespaces = true
-    }
-
-    func parse() -> [TickerItem] {
-        parser.parse()
-        return items
-    }
-
-    func parser(
-        _ parser: XMLParser,
-        didStartElement elementName: String,
-        namespaceURI: String?,
-        qualifiedName qName: String?,
-        attributes attributeDict: [String : String] = [:]
-    ) {
-        let tag = (qName ?? elementName)
-        currentTag = tag
-        elementStack.append(tag)
-
-        if tag == "item" || tag == "entry" {
-            currentTitle = ""
-            currentLink = ""
-            currentDescription = ""
-            currentContentEncoded = ""
-            currentPublishedAt = nil
-            currentDateText = ""
-            imageCandidates.removeAll()
-        }
-
-        let urlAttr = attributeDict["url"] ?? ""
-        let hrefAttr = attributeDict["href"] ?? ""
-        let typeAttr = (attributeDict["type"] ?? "").lowercased()
-        let mediumAttr = (attributeDict["medium"] ?? "").lowercased()
-        let relAttr = (attributeDict["rel"] ?? "").lowercased()
-
-        if tag == "enclosure" {
-            if !urlAttr.isEmpty && (typeAttr.contains("image") || mediumAttr == "image") {
-                imageCandidates.append(urlAttr)
-            }
-        }
-
-        if tag == "media:content" || tag == "media:thumbnail" || tag.hasSuffix(":content") || tag.hasSuffix(":thumbnail") {
-            let candidate = !urlAttr.isEmpty ? urlAttr : hrefAttr
-            if !candidate.isEmpty {
-                if looksLikeImageURL(candidate) || typeAttr.contains("image") || mediumAttr == "image" || typeAttr.isEmpty {
-                    imageCandidates.append(candidate)
-                }
-            }
-        }
-
-        if tag == "itunes:image" {
-            if !hrefAttr.isEmpty {
-                imageCandidates.append(hrefAttr)
-            }
-        }
-
-        if tag == "link" || tag.hasSuffix(":link") {
-            if !hrefAttr.isEmpty {
-                if currentLink.isEmpty || relAttr == "alternate" {
-                    currentLink = hrefAttr
-                }
-                if relAttr == "enclosure" && (typeAttr.contains("image") || looksLikeImageURL(hrefAttr)) {
-                    imageCandidates.append(hrefAttr)
-                }
-            }
+    // MARK: - AI News Sentiment
+    private func scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: Double, force: Bool = false) {
+        sentimentTask?.cancel()
+        sentimentTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            await self.refreshNewsSentimentIfNeeded(force: force)
         }
     }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return }
-
-        let tag = currentTag.lowercased()
-
-        if tag == "title" {
-            currentTitle += trimmed
-        } else if tag == "link" {
-            if currentLink.isEmpty {
-                currentLink += trimmed
-            }
-        } else if tag == "description" || tag == "summary" {
-            currentDescription += string
-        } else if tag == "content:encoded" || tag == "encoded" {
-            currentContentEncoded += string
-        } else if tag == "pubdate" || tag == "published" || tag == "updated" || tag == "dc:date" || tag == "date" {
-            currentDateText += string
-        } else if tag == "url" {
-            if elementStack.contains(where: { $0.lowercased().contains("image") || $0.lowercased().contains("thumbnail") || $0.lowercased().contains("media") }) {
-                imageCandidates.append(trimmed)
-            }
-        }
+    func refreshNewsSentimentAfterRender(delaySeconds: Double = 0.2) {
+        scheduleSentimentComputationAfterRenderIfNeeded(delaySeconds: delaySeconds, force: true)
     }
 
-    func parser(
-        _ parser: XMLParser,
-        didEndElement elementName: String,
-        namespaceURI: String?,
-        qualifiedName qName: String?
-    ) {
-        let tag = (qName ?? elementName)
-        _ = elementStack.popLast()
+    private func refreshNewsSentimentIfNeeded(force: Bool = false) async {
+        let todayKey = Self.dayKey(Date())
+        if !force, sentimentCacheDayKey == todayKey, newsSentiment != nil { return }
 
-        if tag == "item" || tag == "entry" {
-            let cleanTitle = cleanText(currentTitle)
-            guard !cleanTitle.isEmpty else { return }
+        let todays = todaysNewsHeadlines(limit: 40)
+        guard !todays.isEmpty else { return }
+        if isComputingSentiment { return }
 
-            if currentPublishedAt == nil {
-                currentPublishedAt = parseFeedDate(currentDateText)
-            }
+        isComputingSentiment = true
+        defer { isComputingSentiment = false }
 
-            if let pub = currentPublishedAt, pub < cutoffDate(daysAgo: maxAgeDays) {
-                return
-            }
-
-            let linkToUse = currentLink.isEmpty ? "https://\(source.domain)" : currentLink
-            let rawURL = URL(string: linkToUse) ?? URL(string: "https://\(source.domain)")!
-            let finalURL = normalizedArticleURL(rawURL)
-
-            var chosenImage: String? = bestImageCandidate(from: imageCandidates)
-            if chosenImage == nil {
-                chosenImage = extractFirstImageURL(fromHTML: currentContentEncoded) ??
-                              extractFirstImageURL(fromHTML: currentDescription)
-            }
-
-            let mediaURL: URL? = {
-                guard let s = chosenImage else { return nil }
-                let normalized = normalizeURLString(s, baseDomain: source.domain)
-                return URL(string: normalized)
-            }()
-
-            items.append(
-                TickerItem(
-                    text: cleanTitle,
-                    type: type,
-                    value: topicName,
-                    score: nil,
-                    sourceDomain: source.domain,
-                    sourceName: source.name,
-                    mediaURL: mediaURL,
-                    isVideo: false,
-                    articleURL: finalURL,
-                    publishedAt: currentPublishedAt
-                )
+        do {
+            let result = try await OpenAIService.classifySentimentAndSummarize(
+                session: self.session,
+                apiKey: Secrets.openAIKey,
+                headlines: todays
             )
+            self.newsSentiment = result
+            self.sentimentCacheDayKey = todayKey
+            dbg("SENTIMENT: \(result.level.rawValue) | \(result.threeWordSummary)", level: .info)
+        } catch {
+            dbg("❌ Sentiment error: \(error.localizedDescription)", level: .error)
         }
     }
 
-    private func normalizedArticleURL(_ url: URL) -> URL {
-        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        let drop = Set([
-            "utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id","utm_name","utm_reader","utm_referrer",
-            "ref","source","cmpid","mc_cid","mc_eid","ocid"
-        ])
-        if let q = comps.queryItems {
-            comps.queryItems = q.filter { !drop.contains($0.name.lowercased()) }
-        }
-        return comps.url ?? url
-    }
+    private func todaysNewsHeadlines(limit: Int) -> [String] {
+        let cal = Calendar.current
+        let now = Date()
 
-    private func cutoffDate(daysAgo: Int) -> Date {
-        Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date())
-            ?? Date().addingTimeInterval(TimeInterval(-daysAgo * 24 * 60 * 60))
-    }
-
-    private func cleanText(_ raw: String) -> String {
-        raw
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func parseFeedDate(_ raw: String) -> Date? {
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return nil }
-
-        let rfc822 = DateFormatter()
-        rfc822.locale = Locale(identifier: "en_US_POSIX")
-        rfc822.timeZone = TimeZone(secondsFromGMT: 0)
-
-        let formats = [
-            "EEE, dd MMM yyyy HH:mm:ss Z",
-            "EEE, dd MMM yyyy HH:mm Z",
-            "dd MMM yyyy HH:mm:ss Z",
-            "dd MMM yyyy HH:mm Z"
-        ]
-        for f in formats {
-            rfc822.dateFormat = f
-            if let d = rfc822.date(from: s) { return d }
+        let filtered = items.filter { item in
+            guard (item.value ?? "").uppercased() == "NEWS" else { return false }
+            guard let d = item.publishedAt else { return false }
+            return cal.isDate(d, inSameDayAs: now)
         }
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = iso.date(from: s) { return d }
-
-        iso.formatOptions = [.withInternetDateTime]
-        if let d = iso.date(from: s) { return d }
-
-        return nil
-    }
-
-    private func bestImageCandidate(from candidates: [String]) -> String? {
         var seen = Set<String>()
-        let unique = candidates.compactMap { c -> String? in
-            let t = c.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unique = filtered.compactMap { it -> String? in
+            let t = it.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !t.isEmpty else { return nil }
             if seen.contains(t) { return nil }
             seen.insert(t)
             return t
         }
 
-        let imagey = unique.filter { looksLikeImageURL($0) }
-        if let best = imagey.first(where: { $0.lowercased().hasPrefix("https://") }) { return best }
-        if let best = imagey.first(where: { $0.lowercased().hasPrefix("http://") }) { return best }
-        return imagey.first ?? unique.first
+        return Array(unique.prefix(limit))
     }
 
-    private func extractFirstImageURL(fromHTML html: String) -> String? {
-        guard !html.isEmpty else { return nil }
-
-        let patterns: [String] = [
-            #"<img[^>]+(?:src|data-src|data-lazy-src|data-original)\s*=\s*["']([^"']+)["']"#,
-            #"<img[^>]+srcset\s*=\s*["']([^"']+)["']"#,
-            #"<meta[^>]+property\s*=\s*["']og:image["'][^>]+content\s*=\s*["']([^"']+)["']"#,
-            #"<meta[^>]+name\s*=\s*["']twitter:image["'][^>]+content\s*=\s*["']([^"']+)["']"#
-        ]
-
-        for p in patterns {
-            if let match = firstRegexGroup(in: html, pattern: p) {
-                if p.contains("srcset") {
-                    let first = match.split(separator: ",").first?
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .split(separator: " ").first
-                        .map(String.init)
-                    if let first, !first.isEmpty { return first }
-                } else {
-                    return match
-                }
-            }
-        }
-
-        if let url = firstRegexGroup(
-            in: html,
-            pattern: #"(https?:\/\/[^\s"'<>]+?\.(?:jpg|jpeg|png|webp|gif))(?:\?[^\s"'<>]*)?"#
-        ) {
-            return url
-        }
-
-        return nil
-    }
-
-    private func firstRegexGroup(in text: String, pattern: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, options: [], range: range),
-              match.numberOfRanges >= 2,
-              let r = Range(match.range(at: 1), in: text)
-        else { return nil }
-        return String(text[r])
-    }
-
-    private func normalizeURLString(_ raw: String, baseDomain: String) -> String {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        s = s.replacingOccurrences(of: "&amp;", with: "&")
-
-        if s.hasPrefix("//") { s = "https:" + s }
-        if s.hasPrefix("/") { s = "https://\(baseDomain)" + s }
-        return s
-    }
-
-    private func looksLikeImageURL(_ s: String) -> Bool {
-        let lower = s.lowercased()
-        if lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png") || lower.contains(".webp") || lower.contains(".gif") {
-            return true
-        }
-        if lower.contains("image") && (lower.contains("cdn") || lower.contains("img")) {
-            return true
-        }
-        return false
-    }
-}
-
-// MARK: - Staleness helper (kept here to avoid touching Models.swift again)
-private extension TickerItem {
-    func isStale(maxDays: Int) -> Bool {
-        guard let d = publishedAt else { return false } // if no date, keep
-        let cutoff = Calendar.current.date(byAdding: .day, value: -maxDays, to: Date())
-            ?? Date().addingTimeInterval(TimeInterval(-maxDays * 24 * 60 * 60))
-        return d < cutoff
+    private static func dayKey(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: d)
     }
 }

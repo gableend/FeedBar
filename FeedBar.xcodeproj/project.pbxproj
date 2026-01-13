@@ -21,10 +21,14 @@
 			membershipExceptions = (
 				AIDiscoveryService.swift,
 				AppCoordinator.swift,
+				AppLog.swift,
 				FeedBarApp.swift,
+				FeedConfiguration.swift,
 				FeedManager.swift,
 				Helpers.swift,
 				Models.swift,
+				OpenAIService.swift,
+				RSSParser.swift,
 				Secrets.swift,
 				SettingsView.swift,
 				TickerView.swift,
@@ -92,7 +96,7 @@
 			name = FeedBar;
 			packageProductDependencies = (
 			);
-			productName = SuperTicker;
+			productName = FeedBar;
 			productReference = 788483692F10395900E968AE /* FeedBar.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -282,7 +286,7 @@
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/SuperTicker/fetch_trends/_internal",
+					"$(PROJECT_DIR)/fetch_trends/_internal",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FeedBar/Info.plist;
@@ -317,7 +321,7 @@
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(PROJECT_DIR)/SuperTicker/fetch_trends/_internal",
+					"$(PROJECT_DIR)/fetch_trends/_internal",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FeedBar/Info.plist;

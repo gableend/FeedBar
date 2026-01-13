@@ -17,9 +17,12 @@ enum TrendError: Error {
 }
 
 // MARK: - PROTOCOL
-protocol TrendProvider {
+protocol TrendProvider: Sendable {
     func fetchGlobalTrends() async throws -> [TickerItem]
 }
+
+// PythonTrendAdapter is IO-bound and safe to use across concurrency domains, mark as unchecked Sendable
+extension PythonTrendAdapter: @unchecked Sendable {}
 
 // MARK: - PYTHON ADAPTER
 class PythonTrendAdapter: TrendProvider {
@@ -38,7 +41,7 @@ class PythonTrendAdapter: TrendProvider {
                 }
                 
                 guard let path = Bundle.main.path(forResource: self.binaryName, ofType: nil, inDirectory: self.folderName) else {
-                    print("❌ Bundle Error: binary not found")
+                    AppLog.error("❌ Bundle Error: binary not found")
                     continuation.resume(throwing: TrendError.executableNotFound)
                     return
                 }
@@ -85,15 +88,15 @@ class PythonTrendAdapter: TrendProvider {
 
                             }
                         
-                        print("✅ Python Success: Parsed \(tickerItems.count) trends")
+                        AppLog.info("✅ Python Success: Parsed \(tickerItems.count) trends")
                         continuation.resume(returning: tickerItems)
                         
                     } else {
-                        print("❌ Python Output Invalid")
+                        AppLog.warn("❌ Python Output Invalid")
                         continuation.resume(throwing: TrendError.invalidOutput)
                     }
                 } catch {
-                    print("❌ Python Execution Error: \(error)")
+                    AppLog.error("❌ Python Execution Error: \(error)")
                     continuation.resume(throwing: error)
                 }
             }

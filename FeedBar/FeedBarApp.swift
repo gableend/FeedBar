@@ -2,6 +2,10 @@ import SwiftUI
 
 @main
 struct FeedBarApp: App {
+    init() {
+        // Early app-level startup marker; runs before AppDelegate.applicationDidFinishLaunching
+        AppLog.info("FEEDBARAPP init (pid:\(ProcessInfo.processInfo.processIdentifier))")
+    }
     // We bind the AppDelegate here to handle startup logic
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
@@ -11,6 +15,10 @@ struct FeedBarApp: App {
         Settings {
             EmptyView()
         }
+    }
+    // Function to calculate the sum of two numbers
+    func sum(_ a: Int, _ b: Int) -> Int {
+        return a + b
     }
 }
 
@@ -30,8 +38,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.start()
         
         //Healthcheck after 5 mins
-        feedManager.scheduleHealthCheck(after: 300) // 5 minutes
-        
+        Task { @MainActor in
+            // run 5 mins after launch (or change delay)
+            try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
+            feedManager.runHealthCheckNow()
+        }
     }
     
     // Ensure the app stays running even if all windows close (it's a utility)

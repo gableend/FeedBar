@@ -1,7 +1,58 @@
 import Foundation
 import SwiftUI
 import Combine
-// Testing git
+import AppKit
+
+// MARK: - Debug Logging Helper (global)
+
+enum LogLevel: String {
+    case info = "INFO"
+    case warn = "WARN"
+    case error = "ERROR"
+}
+
+@inline(__always)
+func dbg(_ message: String,
+         level: LogLevel = .info,
+         file: String = #file,
+         line: Int = #line) {
+    #if DEBUG
+    let fileName = (file as NSString).lastPathComponent
+    print("FEEDBAR [\(level.rawValue)] \(fileName):\(line) – \(message)")
+    #endif
+}
+
+// MARK: - Network Sessions (tuned for 4000+ item loads)
+enum NetworkSessions {
+    /// For tiny icon assets (favicons).
+    static let icon: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        // Increased from 4 to 8 to reduce "Operation timed out" on slow CDNs
+        c.timeoutIntervalForRequest = 8
+        c.timeoutIntervalForResource = 15
+        c.waitsForConnectivity = false
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        // Increased memory capacity to reduce disk thrashing
+        c.urlCache = URLCache(memoryCapacity: 50 * 1024 * 1024, diskCapacity: 0, diskPath: nil)
+        c.httpMaximumConnectionsPerHost = 4
+        return URLSession(configuration: c)
+    }()
+
+    /// For media thumbnails and OG HTML fetch.
+    static let media: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        // Increased from 6 to 12.
+        // When fetching 100+ images, 6s is too strict and causes "Socket not connected" errors.
+        c.timeoutIntervalForRequest = 12
+        c.timeoutIntervalForResource = 30
+        c.waitsForConnectivity = false
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        c.urlCache = URLCache(memoryCapacity: 100 * 1024 * 1024, diskCapacity: 0, diskPath: nil)
+        c.httpMaximumConnectionsPerHost = 6
+        return URLSession(configuration: c)
+    }()
+}
+
 // MARK: - HTML Decoder
 extension String {
     var decodedHTML: String {
@@ -19,28 +70,19 @@ final class ImageMemoryCache {
     static let shared = ImageMemoryCache()
     private let cache = NSCache<NSString, NSImage>()
 
-    private init() {
-        cache.countLimit = 500
-    }
+    private init() { cache.countLimit = 500 }
 
-    func get(_ key: String) -> NSImage? {
-        cache.object(forKey: key as NSString)
-    }
-
-    func set(_ image: NSImage, for key: String) {
-        cache.setObject(image, forKey: key as NSString)
-    }
+    func get(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
+    func set(_ image: NSImage, for key: String) { cache.setObject(image, forKey: key as NSString) }
 }
 
-// MARK: - Brand icon URL strategy (Clearbit -> DuckDuckGo)
+// MARK: - Brand icon URL strategy
 enum BrandIconProvider {
     static func normalizedDomain(_ raw: String) -> String {
         var d = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         d = d.replacingOccurrences(of: "https://", with: "")
         d = d.replacingOccurrences(of: "http://", with: "")
-        if let slash = d.firstIndex(of: "/") {
-            d = String(d[..<slash])
-        }
+        if let slash = d.firstIndex(of: "/") { d = String(d[..<slash]) }
         if d.hasPrefix("www.") { d = String(d.dropFirst(4)) }
         return d
     }
@@ -64,12 +106,10 @@ enum BrandIconProvider {
         return URL(string: "https://icons.duckduckgo.com/ip3/\(d).ico")
     }
 
-    static func cacheKey(domain: String) -> String {
-        "brandicon:\(normalizedDomain(domain))"
-    }
+    static func cacheKey(domain: String) -> String { "brandicon:\(normalizedDomain(domain))" }
 }
 
-// MARK: - BrandIconLoader (tries 2 URLs, caches results)
+// MARK: - BrandIconLoader
 final class BrandIconLoader: ObservableObject {
     @Published var image: NSImage?
     @Published var hasFailed: Bool = false
@@ -99,17 +139,17 @@ final class BrandIconLoader: ObservableObject {
         cancellable?.cancel()
         image = nil
 
-        fetchImage(url: primary)
+        cancellable = fetchImage(url: primary)
             .flatMap { [weak self] img -> AnyPublisher<NSImage?, Never> in
                 if img != nil { return Just(img).eraseToAnyPublisher() }
                 return self?.fetchImage(url: fallback) ?? Just(nil).eraseToAnyPublisher()
             }
             .receive(on: DispatchQueue.main)
             .sink { [weak self] img in
-                guard let self = self else { return }
+                guard let self else { return }
                 guard self.currentDomainKey == key else { return }
 
-                if let img = img {
+                if let img {
                     self.image = img
                     self.hasFailed = false
                     ImageMemoryCache.shared.set(img, for: key)
@@ -127,44 +167,36 @@ final class BrandIconLoader: ObservableObject {
 
     private func fetchImage(url: URL) -> AnyPublisher<NSImage?, Never> {
         var request = URLRequest(url: url)
-        request.timeoutInterval = 6
+        request.timeoutInterval = 6 // Relaxed from 3
         request.cachePolicy = .returnCacheDataElseLoad
         request.addValue(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             forHTTPHeaderField: "User-Agent"
         )
 
-        return URLSession.shared.dataTaskPublisher(for: request)
-            .map { NSImage(data: $0.data) }
+        return NetworkSessions.icon.dataTaskPublisher(for: request)
+            .map { (data, response) -> NSImage? in
+                return NSImage(data: data)
+            }
             .replaceError(with: nil)
             .eraseToAnyPublisher()
     }
 }
 
-// MARK: - Google favicon URL strategy (matches TickerView)
+// MARK: - Google favicon URL strategy
 enum GoogleFaviconProvider {
     static func normalizedDomain(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !s.isEmpty else { return "" }
 
-        // If it looks like a full URL, extract host
         if s.hasPrefix("http://") || s.hasPrefix("https://") {
-            if let url = URL(string: s), let host = url.host {
-                s = host
-            }
+            if let url = URL(string: s), let host = url.host { s = host }
         } else {
-            // Strip any accidental path fragment
-            if let slash = s.firstIndex(of: "/") {
-                s = String(s[..<slash])
-            }
+            if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
         }
 
-        // Remove www.
         if s.hasPrefix("www.") { s.removeFirst(4) }
-
-        // Remove trailing dot(s)
         while s.hasSuffix(".") { s.removeLast() }
-
         return s
     }
 
@@ -175,19 +207,19 @@ enum GoogleFaviconProvider {
         return true
     }
 
-    static func url(domain raw: String, size: Int = 64) -> URL? {
+    static func url(domain raw: String, size: Int = 128) -> URL? {
         let d = normalizedDomain(raw)
         guard isLikelyDomain(d) else { return nil }
-        return URL(string: "https://www.google.com/s2/favicons?domain=\(d)&sz=\(size)")
+        return URL(string: "https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://\(d)&size=\(size)")
     }
 
-    static func cacheKey(domain raw: String, size: Int = 64) -> String {
+    static func cacheKey(domain raw: String, size: Int = 128) -> String {
         let d = normalizedDomain(raw)
         return "googlefavicon:\(d):\(size)"
     }
 }
 
-// MARK: - Shared favicon store (ObservableObject) for HOME grid and anywhere else
+// MARK: - Shared favicon store
 @MainActor
 final class FaviconStore: ObservableObject {
     static let shared = FaviconStore()
@@ -199,8 +231,7 @@ final class FaviconStore: ObservableObject {
 
     private init() {}
 
-    /// Returns cached image if present (in-memory store or ImageMemoryCache)
-    func image(for domain: String, size: Int = 64) -> NSImage? {
+    func image(for domain: String, size: Int = 128) -> NSImage? {
         let key = GoogleFaviconProvider.cacheKey(domain: domain, size: size)
         if let img = images[key] { return img }
         if let cached = ImageMemoryCache.shared.get(key) {
@@ -210,14 +241,12 @@ final class FaviconStore: ObservableObject {
         return nil
     }
 
-    /// Fetches and caches google favicon. Safe to call repeatedly.
-    func load(domain: String, size: Int = 64) {
+    func load(domain: String, size: Int = 128) {
         let key = GoogleFaviconProvider.cacheKey(domain: domain, size: size)
 
         if images[key] != nil { return }
-        if ImageMemoryCache.shared.get(key) != nil {
-            // hydrate local dictionary so views update without extra calls
-            images[key] = ImageMemoryCache.shared.get(key)
+        if let cached = ImageMemoryCache.shared.get(key) {
+            images[key] = cached
             return
         }
 
@@ -230,15 +259,24 @@ final class FaviconStore: ObservableObject {
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 6
+        request.timeoutInterval = 8 // Relaxed from 4
         request.cachePolicy = .returnCacheDataElseLoad
         request.addValue(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             forHTTPHeaderField: "User-Agent"
         )
 
-        let pub = URLSession.shared.dataTaskPublisher(for: request)
-            .map { NSImage(data: $0.data) }
+        let pub = NetworkSessions.icon.dataTaskPublisher(for: request)
+            .map { (data, response) -> NSImage? in
+                guard let img = NSImage(data: data) else { return nil }
+                // Reject low-res fallback globes if we asked for high-res
+                if size > 32 {
+                    if let rep = img.representations.first, rep.pixelsWide <= 16 {
+                        return nil
+                    }
+                }
+                return img
+            }
             .replaceError(with: nil)
             .receive(on: DispatchQueue.main)
 
@@ -246,19 +284,19 @@ final class FaviconStore: ObservableObject {
             guard let self else { return }
             self.inFlight.remove(key)
             self.cancellables[key] = nil
-
+            
             guard let img else { return }
             self.images[key] = img
             ImageMemoryCache.shared.set(img, for: key)
         }
     }
 
-    func prewarm(domains: [String], size: Int = 64) {
+    func prewarm(domains: [String], size: Int = 128) {
         for d in domains { load(domain: d, size: size) }
     }
 }
 
-// MARK: - RemoteImage (unchanged, useful for media thumbnails)
+// MARK: - RemoteImage
 final class ImageLoader: ObservableObject {
     @Published var image: NSImage?
     @Published var hasFailed = false
@@ -266,15 +304,17 @@ final class ImageLoader: ObservableObject {
 
     func load(url: URL) {
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 12 // Relaxed from 6
         request.cachePolicy = .returnCacheDataElseLoad
         request.addValue(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             forHTTPHeaderField: "User-Agent"
         )
 
-        cancellable = URLSession.shared.dataTaskPublisher(for: request)
-            .map { NSImage(data: $0.data) }
+        cancellable = NetworkSessions.media.dataTaskPublisher(for: request)
+            .map { (data, response) -> NSImage? in
+                return NSImage(data: data)
+            }
             .replaceError(with: nil)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] loadedImage in
@@ -310,20 +350,15 @@ struct RemoteImage: View {
     }
 }
 
-// MARK: - OG Image Enrichment (lazy, non-blocking)
+// MARK: - OG Image Enrichment
 final class OGImageEnricher {
-    private let session: URLSession
+    private let session: URLSession = NetworkSessions.media
     private let queue = DispatchQueue(label: "ogimage.enricher.queue")
 
     private var inFlight = Set<String>()
     private var cache = [String: URL]()
 
-    init() {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 8
-        config.timeoutIntervalForResource = 12
-        self.session = URLSession(configuration: config)
-    }
+    private let maxInFlight = 6
 
     func enqueue(item: TickerItem, onUpdate: @escaping (TickerItem) -> Void) {
         let key = item.articleURL.absoluteString
@@ -347,15 +382,13 @@ final class OGImageEnricher {
             }
 
             if self.inFlight.contains(key) { return }
+            if self.inFlight.count >= self.maxInFlight { return }
             self.inFlight.insert(key)
 
             Task {
-                defer {
-                    self.queue.async { self.inFlight.remove(key) }
-                }
+                defer { self.queue.async { self.inFlight.remove(key) } }
 
                 guard let img = await self.fetchOGImage(from: item.articleURL) else { return }
-
                 self.queue.async { self.cache[key] = img }
 
                 let updated = TickerItem(
@@ -378,7 +411,7 @@ final class OGImageEnricher {
     private func fetchOGImage(from url: URL) async -> URL? {
         do {
             var req = URLRequest(url: url)
-            req.timeoutInterval = 10
+            req.timeoutInterval = 12 // Relaxed from 6
             req.setValue(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
                 forHTTPHeaderField: "User-Agent"
@@ -390,11 +423,9 @@ final class OGImageEnricher {
 
             let (data, resp) = try await session.data(for: req)
             if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) { return nil }
-
             guard let html = String(data: data, encoding: .utf8) else { return nil }
 
-            if let s = firstMetaContent(html, property: "og:image") ??
-                       firstMetaContent(html, name: "twitter:image") {
+            if let s = firstMetaContent(html, property: "og:image") ?? firstMetaContent(html, name: "twitter:image") {
                 let normalized = normalizeImageURL(s, base: url)
                 return URL(string: normalized)
             }

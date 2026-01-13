@@ -48,7 +48,7 @@ class AIDiscoveryService {
         
         // Debugging
         if let debugString = String(data: data, encoding: .utf8) {
-            print("🤖 AI Raw Suggestion: \(debugString)")
+            AppLog.info("🤖 AI Raw Suggestion: \(debugString)")
         }
         
         let openAIResponse = try JSONDecoder().decode(OpenAIResponse.self, from: data)
@@ -60,7 +60,7 @@ class AIDiscoveryService {
         let decodedResponse = try JSONDecoder().decode(AIResponse.self, from: jsonData)
         let candidates = decodedResponse.feeds
         
-        print("🔎 Validating \(candidates.count) candidates...")
+        AppLog.info("🔎 Validating \(candidates.count) candidates...")
         
         // 3. REAL-TIME VALIDATION (The "Anti-Hallucination" Layer)
         // We verify every single URL in parallel before showing it to you.
@@ -70,10 +70,10 @@ class AIDiscoveryService {
             for feed in candidates {
                 group.addTask {
                     if await self.verifyURL(feed.url) {
-                        print("✅ Verified: \(feed.url)")
+                        AppLog.info("✅ Verified: \(feed.url)")
                         return feed
                     } else {
-                        print("❌ Dead Link: \(feed.url)")
+                        AppLog.warn("❌ Dead Link: \(feed.url)")
                         return nil
                     }
                 }

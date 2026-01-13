@@ -10,10 +10,10 @@ extension FeedsTheme {
     static let newsHighContrast = Color(hex: "7E8BA8")
 }
 
-// MARK: - CONSISTENT TOGGLE STYLE (macOS Switch tint is inconsistent)
+// MARK: - CONSISTENT TOGGLE STYLE
 struct SignalSwitchStyle: ToggleStyle {
     var onColor: Color = FeedsTheme.ai
-    var offColor: Color = FeedsTheme.divider.opacity(0.9)
+    var offColor: Color = Color.white.opacity(0.15)
     var knobColor: Color = .white
     var width: CGFloat = 36
     var height: CGFloat = 18
@@ -106,7 +106,7 @@ struct SettingsView: View {
                 }
             }
         }
-        .frame(width: 800, height: 550)
+        .frame(width: 800, height: 650)
     }
 
     func icon(for tab: SettingsTab) -> String {
@@ -123,15 +123,12 @@ struct SettingsView: View {
 struct HomeView: View {
     @ObservedObject var coordinator: AppCoordinator
     @ObservedObject var feedManager: FeedManager
-
-    // Shared favicon cache (Helpers.swift)
     @ObservedObject private var faviconStore = FaviconStore.shared
 
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("showAdminAtStartup") private var showAdminAtStartup = true
     @AppStorage("customFeeds") private var customFeeds = CustomFeedStorage(feeds: [])
 
-    // 16x16 icon grid, no labels
     private let iconSize: CGFloat = 16
     private let tileSize: CGFloat = 26
 
@@ -188,7 +185,6 @@ struct HomeView: View {
                 .cornerRadius(10)
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(FeedsTheme.divider.opacity(0.7), lineWidth: 1))
                 .onAppear {
-                    // Prewarm favicons (fast, same endpoint as TickerView: google s2 favicon)
                     let domains = signalTiles
                         .compactMap { $0.domain }
                         .map { GoogleFaviconProvider.normalizedDomain($0) }
@@ -241,12 +237,11 @@ struct HomeView: View {
         }
     }
 
-    // MARK: - Signal tiles model
     private struct SignalTile {
         let id: String
         let tooltip: String
-        let domain: String?          // if present, loads google favicon via FaviconStore
-        let fallbackIcon: String     // SF Symbol if no domain or icon fails
+        let domain: String?
+        let fallbackIcon: String
         let tint: Color
     }
 
@@ -254,76 +249,43 @@ struct HomeView: View {
         var tiles: [SignalTile] = []
         var seenDomains = Set<String>()
 
-        // NEWS: dedupe by normalized domain
         for s in feedManager.sources {
             let normalized = GoogleFaviconProvider.normalizedDomain(s.domain)
 
             guard GoogleFaviconProvider.isLikelyDomain(normalized) else {
-                tiles.append(
-                    SignalTile(
-                        id: "news-\(s.name)",
-                        tooltip: s.name,
-                        domain: nil,
-                        fallbackIcon: fallbackSymbolFor(name: s.name, domain: s.domain),
-                        tint: FeedsTheme.newsHighContrast
-                    )
-                )
+                tiles.append(SignalTile(id: "news-\(s.name)", tooltip: s.name, domain: nil, fallbackIcon: fallbackSymbolFor(name: s.name, domain: s.domain), tint: FeedsTheme.newsHighContrast))
                 continue
             }
 
             guard !seenDomains.contains(normalized) else { continue }
             seenDomains.insert(normalized)
 
-            tiles.append(
-                SignalTile(
-                    id: "news-\(normalized)",
-                    tooltip: s.name,
-                    domain: normalized,
-                    fallbackIcon: fallbackSymbolFor(name: s.name, domain: s.domain),
-                    tint: FeedsTheme.newsHighContrast
-                )
-            )
+            tiles.append(SignalTile(id: "news-\(normalized)", tooltip: s.name, domain: normalized, fallbackIcon: fallbackSymbolFor(name: s.name, domain: s.domain), tint: FeedsTheme.newsHighContrast))
         }
 
-        // TOPICS: add, but also dedupe domains if they look valid
         for c in customFeeds.feeds {
             let normalized = GoogleFaviconProvider.normalizedDomain(c.domain)
-
             let domainToUse: String?
             if GoogleFaviconProvider.isLikelyDomain(normalized) {
-                if seenDomains.contains(normalized) {
-                    domainToUse = nil // already present, avoid duplicates in grid
-                } else {
+                if seenDomains.contains(normalized) { domainToUse = nil }
+                else {
                     seenDomains.insert(normalized)
                     domainToUse = normalized
                 }
-            } else {
-                domainToUse = nil
-            }
+            } else { domainToUse = nil }
 
-            tiles.append(
-                SignalTile(
-                    id: "topic-\(c.id.uuidString)",
-                    tooltip: c.name,
-                    domain: domainToUse,
-                    fallbackIcon: "dot.radiowaves.left.and.right",
-                    tint: FeedsTheme.ai
-                )
-            )
+            tiles.append(SignalTile(id: "topic-\(c.id.uuidString)", tooltip: c.name, domain: domainToUse, fallbackIcon: "dot.radiowaves.left.and.right", tint: FeedsTheme.ai))
         }
 
-        // SYSTEM: no domain, use SF symbols
         tiles.append(SignalTile(id: "sys-trends", tooltip: "Global Market Trends", domain: nil, fallbackIcon: "chart.line.uptrend.xyaxis", tint: FeedsTheme.trends))
         tiles.append(SignalTile(id: "sys-future", tooltip: "Futurism Signals", domain: nil, fallbackIcon: "sparkles", tint: FeedsTheme.futurism))
 
-        // Keep it tight so Home never needs scroll
         return Array(tiles.prefix(180))
     }
 
     private func fallbackSymbolFor(name: String, domain: String) -> String {
         let n = name.lowercased()
         let d = domain.lowercased()
-
         if n.contains("bbc") || d.contains("bbc") { return "globe.europe.africa.fill" }
         if n.contains("guardian") { return "newspaper.fill" }
         if n.contains("cnn") { return "bolt.horizontal.fill" }
@@ -335,12 +297,11 @@ struct HomeView: View {
         if n.contains("weather") { return "cloud.sun.fill" }
         if n.contains("tech") { return "cpu.fill" }
         if n.contains("finance") || n.contains("ft") || n.contains("bloomberg") { return "banknote.fill" }
-
         return "dot.radiowaves.left.and.right"
     }
 }
 
-// MARK: - Home tile view (uses FaviconStore from Helpers.swift)
+// MARK: - Home tile view
 struct SignalIconTileView: View {
     let domain: String?
     let fallbackSystemIcon: String
@@ -355,19 +316,11 @@ struct SignalIconTileView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 7)
                 .fill(FeedsTheme.inputBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7)
-                        .stroke(FeedsTheme.divider.opacity(0.7), lineWidth: 1)
-                )
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(FeedsTheme.divider.opacity(0.7), lineWidth: 1))
 
-            if let domain,
-               let img = faviconStore.image(for: domain, size: 64) {
+            if let domain, let img = faviconStore.image(for: domain, size: 64) {
                 ZStack {
-                    // Slightly lighter backing so dark favicons don’t disappear
-                    Circle()
-                        .fill(Color.white.opacity(0.16))
-                        .frame(width: size + 8, height: size + 8)
-
+                    Circle().fill(Color.white.opacity(0.16)).frame(width: size + 8, height: size + 8)
                     Image(nsImage: img)
                         .resizable()
                         .interpolation(.high)
@@ -395,22 +348,23 @@ struct SignalIconTileView: View {
     }
 }
 
-// MARK: - 2. SOURCES VIEW (Performance Optimized)
+// MARK: - 2. SOURCES VIEW
 struct SourcesView: View {
     @ObservedObject var feedManager: FeedManager
     @AppStorage("customFeeds") var customFeeds = CustomFeedStorage(feeds: [])
 
-    // CACHE: Store enabled states in memory to avoid UserDefaults lag during scroll
     @State private var enabledStates: [String: Bool] = [:]
-
     @State private var searchText = ""
     @State private var isSearching = false
     @State private var statusMessage: String? = nil
     @State private var newlyAddedIDs: Set<UUID> = []
     @State private var filter: SourceFilter = .all
     @State private var showDeleteConfirmation = false
+    
+    // Tracks open/closed state for RSS Categories
+    @State private var expandedCategories: [String: Bool] = [:]
 
-    // Add RSS by URL
+    // Add RSS
     @State private var rssURLInput: String = ""
     @State private var rssNameInput: String = ""
     @State private var isAddingRSS: Bool = false
@@ -418,7 +372,7 @@ struct SourcesView: View {
     @State private var scrollToID: UUID? = nil
 
     enum SourceFilter: String, CaseIterable {
-        case all = "All", topics = "Topics", news = "News", system = "System"
+        case all = "All", topics = "Topics", news = "RSS Feeds", system = "System"
     }
 
     var body: some View {
@@ -470,42 +424,74 @@ struct SourcesView: View {
                     .disabled(isSearching || searchText.isEmpty)
                 }
 
-                // Add RSS row
+                // Add RSS row (Fixed Layout)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("ADD RSS BY URL")
+                    // 1. Blue Header
+                    Text("ADD RSS FEEDS BY URL")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundColor(FeedsTheme.secondaryText)
+                        .foregroundColor(FeedsTheme.ai)
 
-                    HStack(spacing: 10) {
-                        TextField("RSS URL…", text: $rssURLInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12))
-                            .foregroundColor(.white)
-                            .padding(10)
-                            .background(FeedsTheme.inputBackground)
-                            .cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(FeedsTheme.divider, lineWidth: 1))
+                    HStack(alignment: .bottom, spacing: 10) {
+                        // URL Input - Flexible
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Feed URL").font(.system(size: 9)).foregroundColor(FeedsTheme.secondaryText)
+                            ZStack(alignment: .leading) {
+                                if rssURLInput.isEmpty {
+                                    // 2. Fixed: Text(verbatim:) stops the URL from becoming blue
+                                    Text(verbatim: "https://site.com/feed.xml")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(FeedsTheme.secondaryText.opacity(0.5))
+                                        .allowsHitTesting(false)
+                                        .padding(.leading, 10)
+                                }
+                                TextField("", text: $rssURLInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.white)
+                                    .padding(10)
+                                    .background(FeedsTheme.inputBackground)
+                                    .cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(FeedsTheme.divider, lineWidth: 1))
+                            }
+                        }
 
-                        TextField("Name (optional)", text: $rssNameInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12))
-                            .foregroundColor(.white)
-                            .padding(10)
-                            .frame(width: 170)
-                            .background(FeedsTheme.inputBackground)
-                            .cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(FeedsTheme.divider, lineWidth: 1))
+                        // Name Input - Fixed width to ensure button fits
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Custom Name").font(.system(size: 9)).foregroundColor(FeedsTheme.secondaryText)
+                            ZStack(alignment: .leading) {
+                                if rssNameInput.isEmpty {
+                                    // 2. Consistent Grey Placeholder
+                                    Text("e.g. Sky News")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(FeedsTheme.secondaryText.opacity(0.5))
+                                        .allowsHitTesting(false)
+                                        .padding(.leading, 10)
+                                }
+                                TextField("", text: $rssNameInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.white)
+                                    .padding(10)
+                                    .frame(width: 140)
+                                    .background(FeedsTheme.inputBackground)
+                                    .cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(FeedsTheme.divider, lineWidth: 1))
+                            }
+                        }
 
+                        // Button - Same size as FIND FEEDS
                         Button(action: addRSS) {
                             if isAddingRSS {
                                 ProgressView().controlSize(.small)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
                             } else {
                                 Text("ADD RSS")
                                     .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(.white)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 10)
-                                    .background(FeedsTheme.ai)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
+                                    .background(FeedsTheme.utility) // Grey color
                                     .cornerRadius(6)
                             }
                         }
@@ -555,14 +541,12 @@ struct SourcesView: View {
             .background(FeedsTheme.surface)
             .overlay(Rectangle().frame(height: 1).foregroundColor(FeedsTheme.divider), alignment: .bottom)
 
-            // BULK TOGGLE (applies to current tab)
+            // BULK TOGGLE
             HStack {
                 Text(bulkLabel)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(FeedsTheme.secondaryText)
-
                 Spacer()
-
                 Toggle("", isOn: Binding(
                     get: { isBulkEnabled },
                     set: { newValue in setBulkEnabled(newValue) }
@@ -575,10 +559,10 @@ struct SourcesView: View {
             .background(FeedsTheme.surface)
             .overlay(Rectangle().frame(height: 1).foregroundColor(FeedsTheme.divider.opacity(0.6)), alignment: .bottom)
 
-            // LIST CONTENT (ScrollViewReader so we can jump to newly added feed)
+            // LIST CONTENT
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 1) {
+                    LazyVStack(spacing: 1, pinnedViews: []) {
 
                         // TOPICS
                         if filter == .all || filter == .topics {
@@ -598,23 +582,17 @@ struct SourcesView: View {
                             .background(FeedsTheme.divider.opacity(0.3))
 
                             ForEach(customFeeds.feeds) { feed in
-                                DataRow(
-                                    name: feed.name,
-                                    type: "TOPIC",
-                                    typeColor: FeedsTheme.ai,
-                                    isEnabled: cachedBinding(key: "custom_enabled_\(feed.id.uuidString)", defaultVal: true),
-                                    isNew: newlyAddedIDs.contains(feed.id)
-                                ) {
+                                DataRow(name: feed.name, type: "TOPIC", typeColor: FeedsTheme.ai, isEnabled: cachedBinding(key: "custom_enabled_\(feed.id.uuidString)", defaultVal: true), isNew: newlyAddedIDs.contains(feed.id)) {
                                     deleteFeed(feed)
                                 }
                                 .id(feed.id)
                             }
                         }
 
-                        // NEWS
+                        // RSS FEEDS (Grouped by Category)
                         if filter == .all || filter == .news {
                             HStack {
-                                Text("NEWS")
+                                Text("RSS FEEDS")
                                     .font(.system(size: 10, weight: .bold))
                                     .foregroundColor(FeedsTheme.secondaryText)
                                 Spacer()
@@ -622,15 +600,56 @@ struct SourcesView: View {
                             .padding(20)
                             .background(FeedsTheme.divider.opacity(0.3))
 
-                            ForEach(feedManager.sources) { source in
-                                DataRow(
-                                    name: source.name,
-                                    type: "NEWS",
-                                    typeColor: FeedsTheme.newsHighContrast,
-                                    isEnabled: cachedBinding(key: source.settingKey, defaultVal: source.defaultEnabled),
-                                    isNew: false,
-                                    onDelete: nil
+                            let grouped = Dictionary(grouping: feedManager.sources, by: { $0.category })
+                            let sortedCategories = grouped.keys.sorted()
+
+                            ForEach(sortedCategories, id: \.self) { category in
+                                // Manually implemented expandable section with binding
+                                let isExpandedBinding = Binding(
+                                    get: { expandedCategories[category] ?? false },
+                                    set: { expandedCategories[category] = $0 }
                                 )
+                                
+                                VStack(spacing: 0) {
+                                    Button(action: {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            isExpandedBinding.wrappedValue.toggle()
+                                        }
+                                    }) {
+                                        HStack {
+                                            Image(systemName: "chevron.right")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundColor(FeedsTheme.secondaryText)
+                                                .rotationEffect(.degrees(isExpandedBinding.wrappedValue ? 90 : 0))
+                                                .frame(width: 14)
+                                            
+                                            Text(category.uppercased())
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(FeedsTheme.primaryText)
+                                            
+                                            Spacer()
+                                        }
+                                        .padding(.vertical, 10)
+                                        .padding(.horizontal, 20)
+                                        .background(Color.white.opacity(0.01))
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    if isExpandedBinding.wrappedValue {
+                                        ForEach(grouped[category] ?? []) { source in
+                                            DataRow(
+                                                name: source.name,
+                                                type: "RSS",
+                                                typeColor: FeedsTheme.newsHighContrast,
+                                                isEnabled: cachedBinding(key: source.settingKey, defaultVal: source.defaultEnabled),
+                                                isNew: false,
+                                                onDelete: nil
+                                            )
+                                            .padding(.leading, 14)
+                                            .transition(.opacity)
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -645,54 +664,33 @@ struct SourcesView: View {
                             .padding(20)
                             .background(FeedsTheme.divider.opacity(0.3))
 
-                            DataRow(
-                                name: "Global Market Trends",
-                                type: "TRENDS",
-                                typeColor: FeedsTheme.trends,
-                                isEnabled: cachedBinding(key: "showTrends", defaultVal: true),
-                                isNew: false,
-                                onDelete: nil
-                            )
-                            DataRow(
-                                name: "Futurism Signals",
-                                type: "FUTURE",
-                                typeColor: FeedsTheme.futurism,
-                                isEnabled: cachedBinding(key: "showPredictions", defaultVal: true),
-                                isNew: false,
-                                onDelete: nil
-                            )
+                            DataRow(name: "Global Market Trends", type: "TRENDS", typeColor: FeedsTheme.trends, isEnabled: cachedBinding(key: "showTrends", defaultVal: true), isNew: false, onDelete: nil)
+                            DataRow(name: "Futurism Signals", type: "FUTURE", typeColor: FeedsTheme.futurism, isEnabled: cachedBinding(key: "showPredictions", defaultVal: true), isNew: false, onDelete: nil)
                         }
                     }
                     .padding(.bottom, 40)
                 }
                 .background(FeedsTheme.surface)
-                .scrollIndicators(.visible)
                 .onChange(of: scrollToID) { _, newID in
                     guard let id = newID else { return }
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        scrollToID = nil
-                    }
+                    withAnimation { proxy.scrollTo(id, anchor: .center) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { scrollToID = nil }
                 }
             }
             .alert("Delete all smart topics?", isPresented: $showDeleteConfirmation) {
                 Button("Delete All", role: .destructive) { deleteAllTopics() }
                 Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("This action cannot be undone.")
-            }
+            } message: { Text("This action cannot be undone.") }
         }
         .onAppear { loadEnabledStates() }
     }
 
-    // MARK: - BULK TOGGLE LOGIC
+    // MARK: - Logic
     private var bulkLabel: String {
         switch filter {
         case .all: return "ENABLE ALL SOURCES"
         case .topics: return "ENABLE ALL TOPICS"
-        case .news: return "ENABLE ALL NEWS"
+        case .news: return "ENABLE ALL FEEDS"
         case .system: return "ENABLE ALL SYSTEM"
         }
     }
@@ -706,16 +704,10 @@ struct SourcesView: View {
     private func setBulkEnabled(_ enabled: Bool) {
         let keys = bulkKeysForCurrentFilter()
         guard !keys.isEmpty else { return }
-
-        // Instant UI update
         for k in keys { enabledStates[k] = enabled }
-
-        // Persist + refresh off the render loop
         DispatchQueue.global(qos: .userInitiated).async {
             for k in keys { UserDefaults.standard.set(enabled, forKey: k) }
-            DispatchQueue.main.async {
-                feedManager.softRefresh()
-            }
+            DispatchQueue.main.async { feedManager.softRefresh() }
         }
     }
 
@@ -727,12 +719,9 @@ struct SourcesView: View {
             keys.append(contentsOf: feedManager.sources.map { $0.settingKey })
             keys.append(contentsOf: ["showTrends", "showPredictions"])
             return keys
-        case .topics:
-            return customFeeds.feeds.map { "custom_enabled_\($0.id.uuidString)" }
-        case .news:
-            return feedManager.sources.map { $0.settingKey }
-        case .system:
-            return ["showTrends", "showPredictions"]
+        case .topics: return customFeeds.feeds.map { "custom_enabled_\($0.id.uuidString)" }
+        case .news: return feedManager.sources.map { $0.settingKey }
+        case .system: return ["showTrends", "showPredictions"]
         }
     }
 
@@ -740,13 +729,10 @@ struct SourcesView: View {
         if key == "showTrends" { return true }
         if key == "showPredictions" { return true }
         if key.hasPrefix("custom_enabled_") { return true }
-        if let source = feedManager.sources.first(where: { $0.settingKey == key }) {
-            return source.defaultEnabled
-        }
+        if let source = feedManager.sources.first(where: { $0.settingKey == key }) { return source.defaultEnabled }
         return true
     }
 
-    // MARK: - STATE CACHE
     private func loadEnabledStates() {
         for feed in customFeeds.feeds {
             let key = "custom_enabled_\(feed.id.uuidString)"
@@ -772,7 +758,6 @@ struct SourcesView: View {
         )
     }
 
-    // MARK: - DELETE
     private func deleteAllTopics() {
         customFeeds = CustomFeedStorage(feeds: [])
         UserDefaults.standard.set(customFeeds.rawValue, forKey: "customFeeds")
@@ -789,7 +774,6 @@ struct SourcesView: View {
         loadEnabledStates()
     }
 
-    // MARK: - DISCOVERY
     private func discover() {
         isSearching = true
         statusMessage = "Scanning signal sources..."
@@ -811,7 +795,6 @@ struct SourcesView: View {
                         loadEnabledStates()
                         scrollToID = feeds.first?.id
                     }
-
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                         withAnimation { newlyAddedIDs.removeAll() }
                     }
@@ -825,22 +808,17 @@ struct SourcesView: View {
         }
     }
 
-    // MARK: - Add RSS by URL
     private func addRSS() {
         let urlString = rssURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if urlString.isEmpty { return }
-
         isAddingRSS = true
         rssStatus = "Checking RSS feed…"
 
         Task {
             do {
                 let added = try await feedManager.validateAndAddCustomRSS(urlString: urlString, providedName: rssNameInput)
-
                 await MainActor.run {
-                    self.customFeeds = CustomFeedStorage(rawValue: UserDefaults.standard.string(forKey: "customFeeds") ?? "[]")
-                        ?? CustomFeedStorage(feeds: self.customFeeds.feeds)
-
+                    self.customFeeds = CustomFeedStorage(rawValue: UserDefaults.standard.string(forKey: "customFeeds") ?? "[]") ?? CustomFeedStorage(feeds: self.customFeeds.feeds)
                     filter = .topics
                     newlyAddedIDs = [added.id]
                     scrollToID = added.id
@@ -849,18 +827,13 @@ struct SourcesView: View {
                     rssNameInput = ""
                     loadEnabledStates()
                 }
-
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                     withAnimation { newlyAddedIDs.removeAll() }
                 }
-
                 feedManager.softRefresh()
             } catch {
-                await MainActor.run {
-                    rssStatus = "✕ Invalid feed URL or empty/unparseable feed."
-                }
+                await MainActor.run { rssStatus = "✕ Invalid feed URL or empty/unparseable feed." }
             }
-
             await MainActor.run { isAddingRSS = false }
         }
     }
@@ -873,11 +846,12 @@ struct PreferencesView: View {
 
     @AppStorage("scrollSpeed") private var scrollSpeed = 1.0
     @State private var localScrollSpeed: Double = 1.0
+    
+    @AppStorage("tickerOpacity") private var tickerOpacity = 1.0
+    @State private var localTickerOpacity: Double = 1.0
 
     @AppStorage("weatherCity") private var weatherCity = "Dublin"
     @State private var cityInput = ""
-
-    // Refresh interval (minutes)
     @AppStorage("refreshIntervalMinutes") private var refreshIntervalMinutes: Int = 30
 
     var body: some View {
@@ -922,9 +896,9 @@ struct PreferencesView: View {
                 ConfigSection(title: "DISPLAY GEOMETRY") {
                     ConfigRow(label: "Target Monitor") {
                         Picker("", selection: $coordinator.preferredMonitorName) {
-                            Text("Auto / Main").tag("")
                             ForEach(NSScreen.screens, id: \.localizedName) { screen in
-                                Text(screen.localizedName).tag(screen.localizedName)
+                                let idNum = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+                                Text(screen.localizedName).tag(String(idNum))
                             }
                         }
                         .labelsHidden()
@@ -944,6 +918,22 @@ struct PreferencesView: View {
                             get: { coordinator.tickerSize == 1 ? "Compact" : (coordinator.tickerSize == 2 ? "Standard" : "Large") },
                             set: { val in coordinator.tickerSize = (val == "Compact" ? 1 : (val == "Standard" ? 2 : 4)) }
                         ))
+                    }
+                    
+                    ConfigRow(label: "Background Opacity") {
+                        HStack {
+                            Text("Invisible").font(.caption).foregroundColor(FeedsTheme.secondaryText)
+                            ZStack {
+                                Capsule().fill(FeedsTheme.secondaryText.opacity(0.3)).frame(height: 4)
+                                Slider(value: $localTickerOpacity, in: 0.0...1.0) { editing in
+                                    if !editing { tickerOpacity = localTickerOpacity }
+                                }
+                                .tint(FeedsTheme.utility)
+                            }
+                            Text("Solid").font(.caption).foregroundColor(FeedsTheme.secondaryText)
+                        }
+                        .frame(width: 200)
+                        .onAppear { localTickerOpacity = tickerOpacity }
                     }
                 }
 
