@@ -40,8 +40,9 @@ class PythonTrendAdapter: TrendProvider {
                     return
                 }
                 
+                // PRESERVED: Exact working path logic for folder references
                 guard let path = Bundle.main.path(forResource: self.binaryName, ofType: nil, inDirectory: self.folderName) else {
-                    AppLog.error("❌ Bundle Error: binary not found")
+                    AppLog.error("❌ Bundle Error: binary not found in \(self.folderName)")
                     continuation.resume(throwing: TrendError.executableNotFound)
                     return
                 }
@@ -70,22 +71,32 @@ class PythonTrendAdapter: TrendProvider {
                         let tickerItems = rawTrends
                             .filter { !$0.title.isEmpty && $0.title != "No Title" }
                             .map { trend in
-                                // 1. CLEAN THE DOMAIN for the Favicon
-                                let cleanDom = self.cleanDomain(from: trend.source)
+                                
+                                // 1. ICON LOGIC: Use Helpers.swift to get the real domain
+                                var displayDomain = ""
+                                
+                                // A. Extract from URL (Priority: Shows destination icon like 'github.com')
+                                if let urlObj = URL(string: trend.url), let host = urlObj.host {
+                                    displayDomain = BrandIconProvider.normalizedDomain(host)
+                                }
+                                
+                                // B. Fallback to Source Name if URL domain is invalid
+                                if !BrandIconProvider.isLikelyDomain(displayDomain) {
+                                    displayDomain = self.cleanDomain(from: trend.source)
+                                }
                                 
                                 return TickerItem(
                                     text: trend.title,
-                                    type: .prediction,
+                                    type: .news,              // Changed to .news to ensure UI loads favicon
                                     value: "TRENDS",          // Main Eyebrow
                                     score: trend.volume,      // "500K+" Badge
-                                    sourceDomain: cleanDom,   // "cnbc.com" (For Favicon)
-                                    sourceName: trend.source, // "cnbc business" (For Display)
+                                    sourceDomain: displayDomain, // Valid domain for FaviconStore
+                                    sourceName: trend.source, // "Hacker News" (Display Text)
                                     mediaURL: nil,
                                     isVideo: false,
                                     articleURL: URL(string: trend.url) ?? URL(string: "https://google.com")!,
-                                    publishedAt: Date()       // ✅ NEW required param
+                                    publishedAt: Date()
                                 )
-
                             }
                         
                         AppLog.info("✅ Python Success: Parsed \(tickerItems.count) trends")
@@ -103,16 +114,18 @@ class PythonTrendAdapter: TrendProvider {
         }
     }
     
-    // HELPER: Turns "cnbc business" -> "cnbc.com"
+    // HELPER: Fallback cleaner if URL extraction fails
     private func cleanDomain(from source: String) -> String {
-        let lower = source.lowercased()
+        let lower = source.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Manual mapping for aggregators if URL is missing
+        if lower == "hacker news" { return "news.ycombinator.com" }
+        if lower == "wikipedia" { return "wikipedia.org" }
+        if lower == "bbc" { return "bbc.co.uk" }
+        
         let firstWord = lower.components(separatedBy: CharacterSet.whitespacesAndNewlines).first ?? lower
         
-        // Handle common edge cases
-        if firstWord == "wikipedia" { return "wikipedia.org" }
-        if firstWord == "bbc" { return "bbc.co.uk" }
         if firstWord.contains(".") { return firstWord }
-        
         return "\(firstWord).com"
     }
 }

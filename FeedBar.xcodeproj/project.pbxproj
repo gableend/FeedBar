@@ -31,8 +31,8 @@
 				RSSParser.swift,
 				Secrets.swift,
 				SettingsView.swift,
+				Splash.swift,
 				TickerView.swift,
-				TickerWindow.swift,
 				TrendProvider.swift,
 			);
 			target = 788483682F10395900E968AE /* FeedBar */;

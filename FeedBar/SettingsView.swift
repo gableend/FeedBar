@@ -10,6 +10,19 @@ extension FeedsTheme {
     static let newsHighContrast = Color(hex: "7E8BA8")
 }
 
+// MARK: - WINDOW ACCESSOR (Centers Window on Launch)
+struct WindowAccessor: NSViewRepresentable {
+    var callback: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { self.callback(view.window) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
 // MARK: - CONSISTENT TOGGLE STYLE
 struct SignalSwitchStyle: ToggleStyle {
     var onColor: Color = FeedsTheme.ai
@@ -107,6 +120,11 @@ struct SettingsView: View {
             }
         }
         .frame(width: 800, height: 650)
+        // Auto-center the window when this view appears
+        .background(WindowAccessor { window in
+            window?.center()
+            window?.makeKeyAndOrderFront(nil)
+        })
     }
 
     func icon(for tab: SettingsTab) -> String {
@@ -195,16 +213,20 @@ struct HomeView: View {
             }
             .padding(.horizontal, 26)
 
-            Divider().background(FeedsTheme.divider).padding(.horizontal, 80)
+            // REDUCED WHITESPACE
+            Divider()
+                .background(FeedsTheme.divider)
+                .padding(.horizontal, 80)
+                .padding(.bottom, 6)
 
-            VStack(spacing: 18) {
+            VStack(spacing: 12) { // Reduced spacing
                 Button(action: { coordinator.closeSettings() }) {
                     Text("MINIMIZE TO FEED BAR")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundColor(FeedsTheme.background)
                         .padding(.vertical, 14)
                         .padding(.horizontal, 28)
-                        .background(FeedsTheme.primaryText)
+                        .background(FeedsTheme.utility) // Uses ORANGE (utility color)
                         .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
@@ -250,6 +272,10 @@ struct HomeView: View {
         var seenDomains = Set<String>()
 
         for s in feedManager.sources {
+            // FIX: Filter duplicates by name.
+            // "Global Market Trends" and "Futurism Signals" are appended manually below, so skip them here.
+            if s.name == "Global Market Trends" || s.name == "Futurism Signals" { continue }
+
             let normalized = GoogleFaviconProvider.normalizedDomain(s.domain)
 
             guard GoogleFaviconProvider.isLikelyDomain(normalized) else {
@@ -277,6 +303,7 @@ struct HomeView: View {
             tiles.append(SignalTile(id: "topic-\(c.id.uuidString)", tooltip: c.name, domain: domainToUse, fallbackIcon: "dot.radiowaves.left.and.right", tint: FeedsTheme.ai))
         }
 
+        // Manually appended at the end (This is the only place they should appear)
         tiles.append(SignalTile(id: "sys-trends", tooltip: "Global Market Trends", domain: nil, fallbackIcon: "chart.line.uptrend.xyaxis", tint: FeedsTheme.trends))
         tiles.append(SignalTile(id: "sys-future", tooltip: "Futurism Signals", domain: nil, fallbackIcon: "sparkles", tint: FeedsTheme.futurism))
 
@@ -919,7 +946,14 @@ struct PreferencesView: View {
                             set: { val in coordinator.tickerSize = (val == "Compact" ? 1 : (val == "Standard" ? 2 : 4)) }
                         ))
                     }
-                    
+
+                    // ADDED: Always on Top Toggle with correct label
+                    ConfigRow(label: "Always on top") {
+                        Toggle("", isOn: $coordinator.alwaysOnTop)
+                            .labelsHidden()
+                            .toggleStyle(SignalSwitchStyle(onColor: FeedsTheme.ai))
+                    }
+                   
                     ConfigRow(label: "Background Opacity") {
                         HStack {
                             Text("Invisible").font(.caption).foregroundColor(FeedsTheme.secondaryText)
@@ -967,7 +1001,8 @@ struct PreferencesView: View {
                             Text("Slow").font(.caption).foregroundColor(FeedsTheme.secondaryText)
                             ZStack {
                                 Capsule().fill(FeedsTheme.secondaryText.opacity(0.3)).frame(height: 4)
-                                Slider(value: $localScrollSpeed, in: 0.5...5.0) { editing in
+                                // UPDATED: Slider range increased to 20.0 to match Turbo mode
+                                Slider(value: $localScrollSpeed, in: 0.5...20.0) { editing in
                                     if !editing { scrollSpeed = localScrollSpeed }
                                 }
                                 .tint(FeedsTheme.utility)
