@@ -47,7 +47,6 @@ final class TickerEngine: ObservableObject {
     private var allItems: [TickerItem] = []
     
     // Tracks the index in `allItems` of the very first item currently visible.
-    // We use this to calculate what to prepend (left scroll) or append (right scroll).
     private var firstSourceIndex: Int = 0
     
     private var itemWidths: [UUID: CGFloat] = [:]
@@ -124,17 +123,12 @@ final class TickerEngine: ObservableObject {
         guard !allItems.isEmpty else { return }
 
         // 1. FORWARD RECYCLING (Scrolling Right / Content moving Left)
-        // If the first item has moved completely off-screen to the left...
         while let first = visibleItems.first, let w = itemWidths[first.id] {
             let threshold = -(w + spacing)
             if offset < threshold {
-                // Remove it from the front
                 visibleItems.removeFirst()
-                // Shift offset back to 0-relative to keep the visuals stationary
                 offset += (w + spacing)
-                // Advance our pointer
                 firstSourceIndex = (firstSourceIndex + 1) % allItems.count
-                // Append the next available item to the end
                 appendNextItem()
             } else {
                 break
@@ -142,27 +136,16 @@ final class TickerEngine: ObservableObject {
         }
 
         // 2. BACKWARD RECYCLING (Scrolling Left / Content moving Right)
-        // If there is a gap on the left (offset > 0)...
         while offset > 0 {
-            // Identify the previous item in the circular buffer
             let prevIndex = (firstSourceIndex - 1 + allItems.count) % allItems.count
             let item = allItems[prevIndex]
             
-            // We can only prepend seamlessy if we know the item's width (to adjust offset)
-            guard let w = itemWidths[item.id] else {
-                // Edge Case: If we haven't seen this item yet, we can't scroll back to it smoothly.
-                // This usually only happens at app launch before a full loop.
-                break
-            }
+            guard let w = itemWidths[item.id] else { break }
             
-            // Prepend the item
             visibleItems.insert(item, at: 0)
-            // Move our pointer back
             firstSourceIndex = prevIndex
-            // Shift offset negatively to compensate for the new item's width
             offset -= (w + spacing)
             
-            // Prune the end if we have too many items now
             if visibleItems.count > bufferSize {
                 visibleItems.removeLast()
             }
@@ -224,7 +207,6 @@ struct TickerView: View {
         .contextMenu {
             Toggle("Mini Mode", isOn: $coordinator.isMiniMode)
             Divider()
-            // ✅ FIX: Explicitly call on the object, not the binding
             Button { self.feedManager.softRefresh() } label: { Label("Remix Feed", systemImage: "shuffle") }
             Button { self.feedManager.hardRefresh() } label: { Label("Refresh Now", systemImage: "arrow.clockwise") }
             Divider()
@@ -547,7 +529,7 @@ struct TickerRow: View {
         // Use the source name if available (usually cleaner), otherwise domain
         let raw = item.sourceName.isEmpty ? item.sourceDomain : item.sourceName
         return raw.lowercased()
-            .replacingOccurrences(of: ".com", with: "")
+            .replacingOccurrences(of: ".com", with: "") // ✅ FIXED: Added colon
             .replacingOccurrences(of: ".org", with: "")
             .replacingOccurrences(of: ".net", with: "")
             .replacingOccurrences(of: "www.", with: "")
@@ -559,13 +541,19 @@ struct TickerRow: View {
     private func mainFontSize(_ size: Int) -> CGFloat { size == 1 ? 15 : (size == 4 ? 30 : 22) }
     private func labelFontSize(_ size: Int) -> CGFloat { size == 1 ? 9 : (size == 4 ? 13 : 10) }
 }
+
+// MARK: - ICON VIEW
 struct TickerIconView: View {
     let item: TickerItem
     let size: Int
     @ObservedObject private var faviconStore = FaviconStore.shared
+    
+    // ✅ FIX: Match the server download size
+    private let iconFetchSize = 128
+    
     var body: some View {
         ZStack {
-            if let domain = domainFor(item), let img = faviconStore.image(for: domain, size: 64) {
+            if let domain = domainFor(item), let img = faviconStore.image(for: domain, size: iconFetchSize) { // 👈 Use 128
                 ZStack {
                     Circle().fill(Color.white).frame(width: iconSize + 6, height: iconSize + 6)
                     Image(nsImage: img).resizable().interpolation(.high).aspectRatio(contentMode: .fit).grayscale(1.0).frame(width: iconSize, height: iconSize).clipShape(Circle())
@@ -574,7 +562,7 @@ struct TickerIconView: View {
                 ZStack {
                     Circle().fill(Color.white.opacity(0.1)).frame(width: iconSize + 8, height: iconSize + 8)
                     Image(systemName: fallbackSymbol(for: item)).font(.system(size: iconSize, weight: .semibold)).foregroundColor(item.accentColor)
-                }.onAppear { if let d = domainFor(item) { faviconStore.load(domain: d, size: 64) } }
+                }.onAppear { if let d = domainFor(item) { faviconStore.load(domain: d, size: iconFetchSize) } } // 👈 Use 128
             }
         }.frame(width: boxSize, height: boxSize)
     }

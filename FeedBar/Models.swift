@@ -68,23 +68,23 @@ struct CustomFeedStorage: RawRepresentable {
     }
 }
 
-// MARK: - 2. FEED SOURCE MODEL (The Source of Truth)
 struct FeedSource: Identifiable, Codable, Hashable {
     let id: UUID
     let name: String
     let url: String
     let domain: String
     let defaultEnabled: Bool
-    let category: String
+    let category: String?
+    let icon_url: String? // 👈 ADDED: To capture the server icon
     
-    // Map JSON keys (snake_case) to Swift properties (camelCase)
     enum CodingKeys: String, CodingKey {
         case id, name, url, domain, category
         case defaultEnabled = "default_enabled"
+        case icon_url // 👈 ADDED: To map the JSON key
     }
     
-    // Unique key for UserDefaults
-    var settingKey: String { "source_\(domain)" }
+    // Using ID prevents collisions between sources with same domain
+    var settingKey: String { "source_\(id.uuidString)" }
 }
 
 // MARK: - 5. TICKER ITEM MODEL

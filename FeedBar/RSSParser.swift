@@ -164,24 +164,26 @@ final class RSSParser: NSObject, XMLParserDelegate, @unchecked Sendable {
             guard let articleURL = URL(string: linkStr), !linkStr.isEmpty else { return }
 
             let domain = source.domain.isEmpty ? (articleURL.host ?? "unknown") : source.domain
-            let topicValue = topicName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? source.category.uppercased() : topicName.uppercased()
+            
+            // ✅ FIX: Safely unwrap optional category with default "GENERAL"
+            let safeCategory = source.category ?? "GENERAL"
+            let topicValue = topicName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? safeCategory.uppercased() : topicName.uppercased()
 
             let candidateMedia = mediaURL ?? enclosureURL
             let isVideo = candidateMedia?.pathExtension.lowercased() == "mp4"
 
-            // ✅ FIXED: Mapping local variables to the TickerItem initializer
             let item = TickerItem(
                 text: cleanTitle,
-                type: self.type,               // Uses the type passed into init
-                value: topicValue,             // e.g., "TECH", "POLITICS"
+                type: self.type,
+                value: topicValue,
                 score: nil,
                 sourceDomain: domain,
-                sourceName: source.name,       // Accessing source property
-                sourceIcon: nil,               // Missing parameter fixed (nil is valid URL?)
-                mediaURL: candidateMedia,      // Combined media logic
+                sourceName: source.name,
+                sourceIcon: nil,
+                mediaURL: candidateMedia,
                 isVideo: isVideo,
                 articleURL: articleURL,
-                publishedAt: pubDate           // Uses the parsed date
+                publishedAt: pubDate
             )
 
             items.append(item)

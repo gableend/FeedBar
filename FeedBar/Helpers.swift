@@ -230,6 +230,13 @@ final class FaviconStore: ObservableObject {
     private var cancellables: [String: AnyCancellable] = [:]
 
     private init() {}
+    
+    // 👇 ADD THIS METHOD
+        func inject(image: NSImage, for domain: String) {
+            let key = GoogleFaviconProvider.cacheKey(domain: domain)
+            self.images[key] = image
+            ImageMemoryCache.shared.set(image, for: key)
+        }
 
     func image(for domain: String, size: Int = 128) -> NSImage? {
         let key = GoogleFaviconProvider.cacheKey(domain: domain, size: size)

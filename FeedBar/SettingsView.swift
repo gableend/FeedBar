@@ -236,6 +236,7 @@ struct SourcesView: View {
                 mainListContent
             }
             .background(FeedsTheme.surface)
+            .accentColor(.white) // ✅ Force Chevrons White
             
             footerSection
         }
@@ -306,9 +307,9 @@ struct SourcesView: View {
     private var mainListContent: some View {
         LazyVStack(spacing: 1) {
             if filter == .system {
-                DataRow(name: "Global Market Trends", isEnabled: cachedBinding(key: "showTrends", defaultVal: true), isPersonal: false, isNew: false, onDelete: nil)
+                DataRow(name: "Global Market Trends", isEnabled: cachedBinding(key: "showTrends", defaultVal: true), isPersonal: false, isNew: false, itemCount: 2, onDelete: nil)
                     .padding(.horizontal, 24)
-                DataRow(name: "Futurism Signals", isEnabled: cachedBinding(key: "showPredictions", defaultVal: true), isPersonal: false, isNew: false, onDelete: nil)
+                DataRow(name: "Futurism Signals", isEnabled: cachedBinding(key: "showPredictions", defaultVal: true), isPersonal: false, isNew: false, itemCount: 1, onDelete: nil)
                     .padding(.horizontal, 24)
             } else {
                 let allItems = getUnifiedItems()
@@ -330,9 +331,10 @@ struct SourcesView: View {
                     isEnabled: cachedBinding(key: item.settingKey, defaultVal: item.defaultEnabled),
                     isPersonal: item.isPersonal,
                     isNew: newlyAddedIDs.contains(item.id),
+                    // ✅ FIXED: Pass item count (or 0 if not found)
+                    itemCount: feedManager.itemCount(for: item.name),
                     onDelete: item.isPersonal ? { deletePersonalFeed(id: item.id) } : nil
                 )
-                // DataRow has no internal horizontal padding; we rely on the group's indentation
             }
         } label: {
             HStack {
@@ -342,7 +344,7 @@ struct SourcesView: View {
             }
             .padding(.vertical, 8)
         }
-        .padding(.horizontal, 24) // ✅ FIX: Aligns the Chevron EXACTLY with "SOURCE CONTROL"
+        .padding(.horizontal, 24) // Align chevron with header
     }
 
     private var footerSection: some View {
@@ -373,12 +375,11 @@ struct SourcesView: View {
         
         for c in customFeeds.feeds {
             let savedCat = (c.category ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            // ✅ DYNAMIC MATCHING:
+            // ✅ DYNAMIC MATCHING
             let bestCat: String
-            if !savedCat.isEmpty && liveCategories.contains(savedCat) {
+            if !savedCat.isEmpty && savedCat != "General" && savedCat != "RSS" && liveCategories.contains(savedCat) {
                 bestCat = savedCat
             } else {
-                // Use the Normalizer to match against LIVE categories
                 bestCat = CategoryNormalizer.match(feedName: c.name, url: c.url, liveCategories: liveCategories)
             }
             out.append(UnifiedItem(id: c.id, name: c.name, category: bestCat, settingKey: "custom_enabled_\(c.id.uuidString)", isPersonal: true, defaultEnabled: true))
@@ -393,10 +394,7 @@ struct SourcesView: View {
     
     private func setBulkEnabled(_ enabled: Bool) {
         let keys = filter == .system ? ["showTrends", "showPredictions"] : getUnifiedItems().map { $0.settingKey }
-        for k in keys {
-            enabledStates[k] = enabled
-            UserDefaults.standard.set(enabled, forKey: k)
-        }
+        for k in keys { enabledStates[k] = enabled; UserDefaults.standard.set(enabled, forKey: k) }
         feedManager.softRefresh()
     }
     
@@ -432,7 +430,7 @@ struct SourcesView: View {
             enabledStates[key] = false
             UserDefaults.standard.set(false, forKey: key)
         }
-        let _ = enabledStates // Force refresh
+        let _ = enabledStates
         feedManager.softRefresh()
     }
     
@@ -509,23 +507,59 @@ struct SignalIconTileView: View {
 }
 
 struct DataRow: View {
-    let name: String; @Binding var isEnabled: Bool
-    let isPersonal, isNew: Bool; let onDelete: (() -> Void)?
+    let name: String
+    @Binding var isEnabled: Bool
+    let isPersonal: Bool
+    let isNew: Bool
+    let itemCount: Int // ✅ Correctly receives count
+    let onDelete: (() -> Void)?
+    
     @State private var isHovering = false
+
     var body: some View {
         HStack(spacing: 12) {
             HStack(spacing: 6) {
-                Text(name).font(.system(size: 13, weight: .medium)).foregroundColor(isEnabled ? FeedsTheme.primaryText : FeedsTheme.secondaryText)
+                Text(name).font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isEnabled ? FeedsTheme.primaryText : FeedsTheme.secondaryText)
                 if isPersonal { Circle().fill(FeedsTheme.ai).frame(width: 5, height: 5).padding(.top, 2) }
             }.frame(width: 240, alignment: .leading)
-            if isNew { Text("NEW").font(.system(size: 8, weight: .black)).padding(3).background(FeedsTheme.success).foregroundColor(.black).cornerRadius(2) }
-            Toggle("", isOn: $isEnabled).labelsHidden().toggleStyle(SignalSwitchStyle(onColor: FeedsTheme.ai)).frame(width: 44)
-            Spacer()
-            if let onDelete = onDelete {
-                Button(action: onDelete) { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundColor(isHovering ? .red : FeedsTheme.secondaryText) }
-                    .buttonStyle(.plain).opacity(isHovering ? 1 : 0)
+
+            if isNew {
+                Text("NEW").font(.system(size: 8, weight: .black)).padding(3)
+                    .background(FeedsTheme.success).foregroundColor(.black).cornerRadius(2)
             }
-        }.padding(.horizontal, 0).padding(.vertical, 10).background(isNew ? FeedsTheme.success.opacity(0.1) : (isHovering ? FeedsTheme.divider.opacity(0.3) : Color.clear)).onHover { isHovering = $0 }
+
+            Spacer()
+
+            // ✅ Live Item Count
+            Text("\(itemCount)")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(itemCount > 0 ? FeedsTheme.secondaryText : .red.opacity(0.6))
+                .frame(width: 30, alignment: .trailing)
+                .padding(.trailing, 4)
+
+            Toggle("", isOn: $isEnabled)
+                .labelsHidden()
+                .toggleStyle(SignalSwitchStyle(onColor: FeedsTheme.ai))
+                .frame(width: 44)
+
+            if let onDelete = onDelete {
+                Button(action: onDelete) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(isHovering ? .red : FeedsTheme.secondaryText)
+                }
+                .buttonStyle(.plain)
+                .opacity(isHovering ? 1 : 0)
+                .frame(width: 20)
+            } else {
+                Spacer().frame(width: 20)
+            }
+        }
+        .padding(.horizontal, 0)
+        .padding(.vertical, 10)
+        .background(isNew ? FeedsTheme.success.opacity(0.1) : (isHovering ? FeedsTheme.divider.opacity(0.3) : Color.clear))
+        .onHover { isHovering = $0 }
     }
 }
 
