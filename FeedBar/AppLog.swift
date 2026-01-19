@@ -20,7 +20,6 @@ nonisolated enum AppLog {
     nonisolated(unsafe) static var level: Level = .info
     
     /// Mirror to stderr. Useful when Xcode console is working.
-    /// Defaults to true in DEBUG, false in Release.
     nonisolated(unsafe) static var mirrorToStderr: Bool = {
     #if DEBUG
         return true
@@ -50,6 +49,7 @@ extension AppLog {
     nonisolated private static func log(_ levelValue: Level, _ label: String, _ msg: String) {
         guard levelValue.rawValue <= level.rawValue else { return }
 
+        // ✅ Uses the fixed nonisolated(unsafe) formatter below
         let timestamp = ISO8601DateFormatter.withFractionalSeconds.string(from: Date())
         let line = "\(timestamp) [\(label)] pid=\(getpid()) \(msg)\n"
 
@@ -101,7 +101,10 @@ extension AppLog {
 }
 
 private extension ISO8601DateFormatter {
-    nonisolated static let withFractionalSeconds: ISO8601DateFormatter = {
+    // ✅ FIXED: Changed to nonisolated(unsafe) to clear line 104 warning
+    // ISO8601DateFormatter isn't Sendable, but since we only use it as a
+    // constant for string conversion, this is safe for a logging context.
+    nonisolated(unsafe) static let withFractionalSeconds: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f

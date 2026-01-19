@@ -3,8 +3,7 @@ import Combine
 import SwiftUI
 import CoreLocation
 
-// MARK: - GLOBAL MODELS (Fixed Scope)
-// ✅ This MUST be outside the class and any extensions to be found by the compiler.
+// MARK: - GLOBAL MODELS
 struct UnifiedItem: Identifiable, Equatable {
     let id: UUID
     let name: String
@@ -42,17 +41,19 @@ final class FeedManager: NSObject, ObservableObject {
     }()
     
     private var refreshTask: Task<Void, Never>?
+    private var autoRefreshTask: Task<Void, Never>? // ✅ For modern Task-based timer
     private var allFeedItems: [TickerItem] = []
     var customFeedsMap: [UUID: CustomFeed] = [:]
     
     override init() {
         super.init()
         loadCustomFeeds()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            // ✅ FIX: Using @MainActor Task to bridge background dispatch to actor self
-            Task { @MainActor in
-                self?.hardRefresh()
-            }
+        
+        // Initial refresh
+        Task {
+            // Slight delay to allow environment to settle
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await fetchFromNetlify()
         }
     }
     
@@ -113,7 +114,6 @@ final class FeedManager: NSObject, ObservableObject {
             let activeSourceNames = Set(envelope.items.map { $0.sourceName })
             let validSources = envelope.sources.filter { activeSourceNames.contains($0.name) }
             
-            // Background task handles pre-warming
             prewarmServerIcons(sources: validSources)
 
             self.sources = validSources
@@ -176,11 +176,11 @@ final class FeedManager: NSObject, ObservableObject {
             let savedCat = c.category ?? ""
             let bestCat: String
             
-            // ✅ FIX: No more await inside ternary. This resolves the line 133 warning.
+            // ✅ FIX: Removed 'await' because CategoryNormalizer.match is synchronous
             if !savedCat.isEmpty && savedCat != "General" && savedCat != "RSS" && liveCategories.contains(savedCat) {
                 bestCat = savedCat
             } else {
-                bestCat = await CategoryNormalizer.match(feedName: c.name, url: c.url, liveCategories: liveCategories)
+                bestCat = CategoryNormalizer.match(feedName: c.name, url: c.url, liveCategories: liveCategories)
             }
             
             unified.append(UnifiedItem(
@@ -203,11 +203,15 @@ final class FeedManager: NSObject, ObservableObject {
         self.itemsRevision += 1
     }
 
+    /// ✅ FIXED: Replaced Timer with Task-based loop to solve MainActor capture violation
     func startAutoRefresh(interval: TimeInterval) {
-        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            // ✅ FIX: Bridging background timer thread to MainActor FeedManager
-            Task { @MainActor in
-                self?.hardRefresh()
+        autoRefreshTask?.cancel()
+        autoRefreshTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                if !Task.isCancelled {
+                    self.hardRefresh() // Safe because Task is isolated to the actor
+                }
             }
         }
     }

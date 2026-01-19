@@ -301,6 +301,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 2.0.1;
+				OTHER_SWIFT_FLAGS = "-Xfrontend -debug-time-function-bodies -warn-concurrency";
 				PRODUCT_BUNDLE_IDENTIFIER = com.graemechard.FeedBar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -336,6 +337,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 2.0.1;
+				OTHER_SWIFT_FLAGS = "-Xfrontend -debug-time-function-bodies -warn-concurrency";
 				PRODUCT_BUNDLE_IDENTIFIER = com.graemechard.FeedBar;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
