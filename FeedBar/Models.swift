@@ -13,7 +13,6 @@ struct NewsSentiment: Codable, Sendable {
 
 // MARK: - 2. FEEDS BRAND KIT
 struct FeedsTheme {
-    // ✅ FIXED: Calls now match the updated extension signature
     static let background = Color(hex: "0E0F11")
     static let primaryText = Color(hex: "F4F5F7")
     static let secondaryText = Color(hex: "8A8F98")
@@ -43,7 +42,8 @@ struct CustomFeed: Identifiable, Codable, Hashable, Sendable {
     let category: String?
     let domain: String
     
-    init(id: UUID = UUID(), name: String, url: String, category: String? = nil, domain: String) {
+    // ✅ FIXED: Explicitly nonisolated to allow background creation
+    nonisolated init(id: UUID = UUID(), name: String, url: String, category: String? = nil, domain: String) {
         self.id = id
         self.name = name
         self.url = url
@@ -111,7 +111,8 @@ struct TickerItem: Identifiable, Hashable, Equatable, Codable, Sendable {
         return "\(label) • \(formatter.string(from: date))"
     }
 
-    init(text: String, type: TickerType, value: String?, score: String?, sourceDomain: String, sourceName: String, sourceIcon: URL?, mediaURL: URL?, isVideo: Bool, articleURL: URL, publishedAt: Date?) {
+    // ✅ FIXED: Added nonisolated to allow background thread creation
+    nonisolated init(text: String, type: TickerType, value: String?, score: String?, sourceDomain: String, sourceName: String, sourceIcon: URL?, mediaURL: URL?, isVideo: Bool, articleURL: URL, publishedAt: Date?) {
         self.id = UUID()
         self.text = text
         self.type = type
@@ -194,7 +195,6 @@ struct SignalTile: Identifiable, Sendable {
 
 // MARK: - Color Extension
 extension Color {
-    // ✅ FIXED: Added 'hex' label to make the call FeedsTheme unambiguous
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         var int: UInt64 = 0

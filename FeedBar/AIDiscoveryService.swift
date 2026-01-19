@@ -1,7 +1,7 @@
 import Foundation
 
-@MainActor
-class AIDiscoveryService {
+// ✅ Removed @MainActor - this service is stateless and can run on any thread
+final class AIDiscoveryService: Sendable {
     static let shared = AIDiscoveryService()
     
     private let apiKey = Secrets.openAIKey
@@ -47,7 +47,6 @@ class AIDiscoveryService {
             return []
         }
         
-        // ✅ Using the global AIResponse model instead of a local redeclaration
         let decodedResponse = try JSONDecoder().decode(AIResponse.self, from: jsonData)
         let candidates = decodedResponse.feeds
         
@@ -58,12 +57,13 @@ class AIDiscoveryService {
             for feedItem in candidates {
                 group.addTask {
                     if await self.verifyURL(feedItem.url) {
-                        // ✅ Swift 6 Fix: Awaiting MainActor-isolated init and static methods
-                        return await CustomFeed(
+                        // ✅ FIXED: No await needed because init and normalizedDomain are now nonisolated
+                        let domain = BrandIconProvider.normalizedDomain(feedItem.url)
+                        return CustomFeed(
                             name: feedItem.name,
                             url: feedItem.url,
                             category: feedItem.category,
-                            domain: await BrandIconProvider.normalizedDomain(feedItem.url)
+                            domain: domain
                         )
                     }
                     return nil
@@ -80,7 +80,7 @@ class AIDiscoveryService {
         return validFeeds
     }
     
-    nonisolated private func verifyURL(_ urlString: String) async -> Bool {
+    private func verifyURL(_ urlString: String) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"

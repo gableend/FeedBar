@@ -5,16 +5,11 @@ import AppKit
 
 // MARK: - Debug Logging Helper
 enum LogLevel: String {
-    case info = "INFO"
-    case warn = "WARN"
-    case error = "ERROR"
+    case info = "INFO", warn = "WARN", error = "ERROR"
 }
 
 @inline(__always)
-func dbg(_ message: String,
-         level: LogLevel = .info,
-         file: String = #file,
-         line: Int = #line) {
+func dbg(_ message: String, level: LogLevel = .info, file: String = #file, line: Int = #line) {
     #if DEBUG
     let fileName = (file as NSString).lastPathComponent
     print("FEEDBAR [\(level.rawValue)] \(fileName):\(line) – \(message)")
@@ -55,8 +50,6 @@ extension String {
             .documentType: NSAttributedString.DocumentType.html,
             .characterEncoding: String.Encoding.utf8.rawValue
         ]
-        // This performs a UI-related string conversion, but on background threads
-        // we use a plain conversion if AttributedString fails
         return (try? NSAttributedString(data: data, options: options, documentAttributes: nil).string) ?? self
     }
 }
@@ -74,7 +67,8 @@ final class ImageMemoryCache: @unchecked Sendable {
 
 // MARK: - Brand Icon Strategy
 enum BrandIconProvider {
-    static func normalizedDomain(_ raw: String) -> String {
+    // ✅ FIXED: Marked all as nonisolated for background thread use
+    nonisolated static func normalizedDomain(_ raw: String) -> String {
         var d = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         d = d.replacingOccurrences(of: "https://", with: "")
         d = d.replacingOccurrences(of: "http://", with: "")
@@ -83,29 +77,30 @@ enum BrandIconProvider {
         return d
     }
 
-    static func isLikelyDomain(_ d: String) -> Bool {
+    nonisolated static func isLikelyDomain(_ d: String) -> Bool {
         guard !d.isEmpty, d.contains("."), d.count >= 4 else { return false }
         return true
     }
 
-    static func primaryURL(domain: String) -> URL? {
+    nonisolated static func primaryURL(domain: String) -> URL? {
         let d = normalizedDomain(domain)
         guard isLikelyDomain(d) else { return nil }
         return URL(string: "https://logo.clearbit.com/\(d)?size=128")
     }
 
-    static func fallbackURL(domain: String) -> URL? {
+    nonisolated static func fallbackURL(domain: String) -> URL? {
         let d = normalizedDomain(domain)
         guard isLikelyDomain(d) else { return nil }
         return URL(string: "https://icons.duckduckgo.com/ip3/\(d).ico")
     }
 
-    static func cacheKey(domain: String) -> String { "brandicon:\(normalizedDomain(domain))" }
+    nonisolated static func cacheKey(domain: String) -> String { "brandicon:\(normalizedDomain(domain))" }
 }
 
 // MARK: - Google Favicon Strategy
 enum GoogleFaviconProvider {
-    static func normalizedDomain(_ raw: String) -> String {
+    // ✅ FIXED: Marked all as nonisolated for background thread use
+    nonisolated static func normalizedDomain(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !s.isEmpty else { return "" }
         if s.hasPrefix("http://") || s.hasPrefix("https://") {
@@ -118,18 +113,19 @@ enum GoogleFaviconProvider {
         return s
     }
 
-    static func url(domain raw: String, size: Int = 128) -> URL? {
+    nonisolated static func url(domain raw: String, size: Int = 128) -> URL? {
         let d = normalizedDomain(raw)
         guard !d.isEmpty, d.contains(".") else { return nil }
         return URL(string: "https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://\(d)&size=\(size)")
     }
 
-    static func cacheKey(domain raw: String, size: Int = 128) -> String {
+    nonisolated static func cacheKey(domain raw: String, size: Int = 128) -> String {
         return "googlefavicon:\(normalizedDomain(raw)):\(size)"
     }
 }
 
 // MARK: - Shared Favicon Store
+// Drives UI components, so it remains MainActor isolated
 @MainActor
 final class FaviconStore: ObservableObject {
     static let shared = FaviconStore()
