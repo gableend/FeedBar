@@ -25,14 +25,11 @@ struct PlacementSlot: Identifiable, Equatable {
 class AppCoordinator: NSObject, ObservableObject {
     let feedManager: FeedManager
     
-    // Custom HardLockWindow
     private var tickerWindow: HardLockWindow?
     private var settingsWindow: NSWindow?
-    
     private var isLayoutInProgress = false
     
     @Published var isMiniMode: Bool = false
-    
     @Published var availableSlots: [PlacementSlot] = []
     
     // MARK: - PREFERENCES
@@ -97,19 +94,18 @@ class AppCoordinator: NSObject, ObservableObject {
         ensureWindowExists()
         applyLayoutSafe()
         
-        // Admin UI follows Ticker (Slight delay to ensure Ticker is placed first)
         if UserDefaults.standard.bool(forKey: "hasLaunchedBefore") == false || showAdminAtStartup {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 self.openSettings()
             }
         }
-        if UserDefaults.standard.bool(forKey: "hasLaunchedBefore") == false {
+        
+        if !UserDefaults.standard.bool(forKey: "hasLaunchedBefore") {
             UserDefaults.standard.set(true, forKey: "hasLaunchedBefore")
         }
     }
     
     @objc private func screenConfigChanged() {
-        // print("DEBUG: Screen config changed.")
         if !isLayoutInProgress {
             generatePlacementMap()
             applyLayoutSafe()
@@ -128,25 +124,19 @@ class AppCoordinator: NSObject, ObservableObject {
         let screens = NSScreen.screens
         let height = heightForSize(tickerSize)
         
-        // print("--- SCREEN MAP ---")
         for screen in screens {
             let id = String(getScreenID(screen))
             let name = screen.localizedName
             let visible = screen.visibleFrame
             
-            // Bottom
             let bottomFrame = NSRect(x: visible.origin.x, y: visible.minY, width: visible.width, height: height)
             let bottomSlot = PlacementSlot(id: "\(id)-bottom", screenID: id, screenName: name, position: "Bottom", frame: bottomFrame, screenObject: screen)
             slots.append(bottomSlot)
             
-            // Top
             let topFrame = NSRect(x: visible.origin.x, y: visible.maxY - height, width: visible.width, height: height)
             let topSlot = PlacementSlot(id: "\(id)-top", screenID: id, screenName: name, position: "Top", frame: topFrame, screenObject: screen)
             slots.append(topSlot)
-            
-            // print("Slot: \(bottomSlot.debugDescription)")
         }
-        // print("------------------")
         self.availableSlots = slots
     }
     
@@ -173,21 +163,20 @@ class AppCoordinator: NSObject, ObservableObject {
         window.setFrameAutosaveName("")
         
         self.tickerWindow = window
-        
-        // Initial setup
         configureContentView(for: window)
     }
     
-    // Setup content view with AutoLayout to ensure full edge-to-edge filling
     private func configureContentView(for window: NSWindow) {
+        // ✅ FIX: The view is created once and observes 'coordinator'
+        // SwiftUICore handles the layout within the frame we provide via the window.
         let rootView = TickerView(feedManager: feedManager, coordinator: self)
             .edgesIgnoringSafeArea(.all)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         
         window.contentView = hostingView
+        // Allow the hosting view to expand with the window frame automatically
         hostingView.autoresizingMask = [.width, .height]
     }
     
@@ -204,39 +193,34 @@ class AppCoordinator: NSObject, ObservableObject {
         ensureWindowExists()
         guard let window = tickerWindow else { return }
         
-        // 1. Find Target Slot
-        let slot = getCurrentTargetSlot() ?? availableSlots.first ?? PlacementSlot(id: "def", screenID: "0", screenName: "Unknown", position: "Bottom", frame: .zero, screenObject: NSScreen.main!)
+        // ✅ FIX: Safe unwrapping of slots and screens
+        guard let slot = getCurrentTargetSlot() ?? availableSlots.first else {
+            return // No screens available yet
+        }
         
-        // print("DEBUG: LOCKED Target Frame -> \(slot.debugDescription)")
-        
-        // 2. RESIZE CONTENT VIEW (CRITICAL FIX FOR CLIPPPING)
-        // We inject the EXACT WIDTH and force LEADING alignment.
-        let sizedView = TickerView(feedManager: feedManager, coordinator: self)
-            .edgesIgnoringSafeArea(.all)
-            .frame(width: slot.frame.width, height: slot.frame.height, alignment: .leading)
-            .id(UUID()) // Force redraw
-        
-        window.contentView = NSHostingView(rootView: sizedView)
-        
-        // 3. LOCK AND MOVE
+        // ✅ FIX: Stop re-assigning contentView.
+        // Simply update the window frame. The NSHostingView with .width/.height autoresizing
+        // will adjust the SwiftUI view automatically.
         window.targetFrame = slot.frame
         window.setFrame(slot.frame, display: true, animate: false)
-        window.orderFront(nil)
         
-        // Move Settings Window if open
+        if !window.isVisible {
+            window.orderFront(nil)
+        }
+        
         snapSettingsToTicker()
     }
     
     private func snapSettingsToTicker() {
         guard let win = settingsWindow, win.isVisible else { return }
         
-        // Priority 1: Use actual window location if possible
-        if let tickerScreen = tickerWindow?.screen {
-            centerWindow(win, on: tickerScreen)
-        }
-        // Priority 2: Use theoretical slot location
-        else if let slot = getCurrentTargetSlot() {
-            centerWindow(win, on: slot.screenObject)
+        // Priority: Current Ticker Screen -> Target Screen Setting -> Main Screen
+        let targetScreen = tickerWindow?.screen ?? NSScreen.screens.first { screen in
+            String(getScreenID(screen)) == preferredMonitorName
+        } ?? NSScreen.main
+        
+        if let screen = targetScreen {
+            centerWindow(win, on: screen)
         }
     }
     
@@ -251,9 +235,9 @@ class AppCoordinator: NSObject, ObservableObject {
     // MARK: - ADMIN UI HELPERS
     func openSettings() {
         if let win = settingsWindow {
+            snapSettingsToTicker()
             win.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
-            snapSettingsToTicker()
             return
         }
         
@@ -273,7 +257,6 @@ class AppCoordinator: NSObject, ObservableObject {
     
     func closeSettings() { settingsWindow?.close() }
     func showTicker() { applyLayoutSafe() }
-    func updateSettings(position: TickerPosition? = nil, size: Int? = nil, onTop: Bool? = nil, monitor: String? = nil) {}
     
     // MARK: - PRIVATE HELPERS
     private func getCurrentTargetSlot() -> PlacementSlot? {
@@ -322,13 +305,10 @@ class HardLockWindow: NSWindow {
     
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
         if let target = targetFrame {
-            // Check for BOTH Origin drift AND Size clamping
-            let posChanged = abs(frameRect.origin.x - target.origin.x) > 5 || abs(frameRect.origin.y - target.origin.y) > 5
-            let sizeChanged = abs(frameRect.width - target.width) > 5 || abs(frameRect.height - target.height) > 5
+            let posChanged = abs(frameRect.origin.x - target.origin.x) > 2 || abs(frameRect.origin.y - target.origin.y) > 2
+            let sizeChanged = abs(frameRect.width - target.width) > 2 || abs(frameRect.height - target.height) > 2
             
             if posChanged || sizeChanged {
-                // Uncomment to see the OS fighting back
-                // print("BLOCKED: System change to \(frameRect). Reseting to \(target)")
                 super.setFrame(target, display: displayFlag)
                 return
             }

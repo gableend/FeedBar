@@ -3,24 +3,38 @@ import Combine
 import SwiftUI
 import CoreLocation
 
+// MARK: - GLOBAL MODELS (Fixed Scope)
+// ✅ This MUST be outside the class and any extensions to be found by the compiler.
+struct UnifiedItem: Identifiable, Equatable {
+    let id: UUID
+    let name: String
+    let category: String
+    let settingKey: String
+    let isPersonal: Bool
+    let defaultEnabled: Bool
+    let domain: String
+}
+
 @MainActor
 final class FeedManager: NSObject, ObservableObject {
     // MARK: - PUBLISHED PROPERTIES
     @Published var items: [TickerItem] = []
     @Published var sources: [FeedSource] = []
+    @Published var customFeeds: [CustomFeed] = []
+    @Published var unifiedSources: [UnifiedItem] = []
     @Published var isReady: Bool = false
     
-    // AI & Sentiment Properties
     @Published var newsSentiment: NewsSentiment?
     @Published var aiFutureSummary: String = "SCANNING HORIZON..."
     @Published var aiTrendSummary: String = "PULSING DATA..."
     @Published var aiScienceSummary: String = "RESEARCHING..."
     @Published var aiSportsSummary: String = "CHECKING SCORES..."
     @Published var aiResearchSummary: String = "MODELING..."
+    
     @Published var currentWeatherTemp: String?
     @Published var itemsRevision: Int = 0
     
-    // Internal State
+    // MARK: - INTERNAL STATE
     private lazy var session: URLSession = {
         let c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20.0
@@ -29,14 +43,16 @@ final class FeedManager: NSObject, ObservableObject {
     
     private var refreshTask: Task<Void, Never>?
     private var allFeedItems: [TickerItem] = []
-    
     var customFeedsMap: [UUID: CustomFeed] = [:]
     
     override init() {
         super.init()
-        loadCustomFeeds() // This will work now
+        loadCustomFeeds()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.hardRefresh()
+            // ✅ FIX: Using @MainActor Task to bridge background dispatch to actor self
+            Task { @MainActor in
+                self?.hardRefresh()
+            }
         }
     }
     
@@ -53,62 +69,57 @@ final class FeedManager: NSObject, ObservableObject {
             self.itemsRevision += 1
         }
     }
-    
+
     func runHealthCheckNow() {
-        Task { AppLog.info("SYSTEM: 🩺 Manual Health Check Triggered...") }
-    }
-    
-    // MARK: - FETCHING LOGIC
-    
-    private struct ServerEnvelope: Decodable {
-        let items: [TickerItem]
-        let sources: [FeedSource]
+        print("SYSTEM: 🩺 Manual Health Check Triggered...")
     }
 
+    func getSignalTiles() -> [SignalTile] {
+        var tiles: [SignalTile] = []
+        var seenDomains = Set<String>()
+        
+        for item in unifiedSources {
+            let domainKey = item.domain.isEmpty ? GoogleFaviconProvider.normalizedDomain(item.name) : item.domain
+            
+            if !seenDomains.contains(domainKey) {
+                seenDomains.insert(domainKey)
+                tiles.append(SignalTile(
+                    id: item.id.uuidString,
+                    tooltip: item.name,
+                    domain: domainKey,
+                    tint: FeedsTheme.categoryColor(for: item.category)
+                ))
+            }
+        }
+        return Array(tiles.prefix(180))
+    }
+
+    // MARK: - FETCHING LOGIC
+    
     private func fetchFromNetlify() async {
         guard let url = URL(string: "https://feedbarserver.netlify.app/.netlify/functions/manifest") else { return }
         
         do {
             let (data, _) = try await session.data(from: url)
-            
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             
-            let envelope = try decoder.decode(ServerEnvelope.self, from: data)
-            
-            // ---------------------------------------------------------
-            // 1. FILTER ZERO-ITEM SOURCES
-            // ---------------------------------------------------------
-            let activeSourceNames = Set(envelope.items.map { $0.sourceName })
-            
-            let validSources = envelope.sources.filter { source in
-                activeSourceNames.contains(source.name)
+            struct ServerEnvelope: Decodable {
+                let items: [TickerItem]
+                let sources: [FeedSource]
             }
             
-            // ---------------------------------------------------------
-            // 2. PRE-WARM ICONS (Cache Injection)
-            // ---------------------------------------------------------
+            let envelope = try decoder.decode(ServerEnvelope.self, from: data)
+            let activeSourceNames = Set(envelope.items.map { $0.sourceName })
+            let validSources = envelope.sources.filter { activeSourceNames.contains($0.name) }
+            
+            // Background task handles pre-warming
             prewarmServerIcons(sources: validSources)
 
-            // ---------------------------------------------------------
-            // 3. LOGGING
-            // ---------------------------------------------------------
-            print("==================================================")
-            print("📥 MANIFEST PROCESSED")
-            print("   - Raw Items: \(envelope.items.count)")
-            print("   - Raw Sources: \(envelope.sources.count)")
-            print("   - Valid Sources: \(validSources.count)")
-            print("--------------------------------------------------")
-
-            // Update State
-            await MainActor.run {
-                self.sources = validSources
-            }
-            
+            self.sources = validSources
             self.allFeedItems = envelope.items
             
             await rebuildUI()
-            
             withAnimation { self.isReady = true }
             
         } catch {
@@ -118,68 +129,101 @@ final class FeedManager: NSObject, ObservableObject {
         }
     }
     
-    /// Downloads icons from the server manifest and injects them into FaviconStore
     private func prewarmServerIcons(sources: [FeedSource]) {
-        Task.detached(priority: .background) {
+        Task {
             for source in sources {
-                // Skip if no icon provided by server
-                guard let urlString = source.icon_url, let url = URL(string: urlString) else { continue }
-                
-                // 1. Check if FaviconStore already has it (via the Google key format)
                 let key = GoogleFaviconProvider.cacheKey(domain: source.domain, size: 128)
                 if ImageMemoryCache.shared.get(key) != nil { continue }
                 
-                // 2. Download
-                if let data = try? Data(contentsOf: url), let image = NSImage(data: data) {
-                    // 3. Inject into the Main Thread Store
-                    await MainActor.run {
-                        FaviconStore.shared.inject(image: image, for: source.domain)
+                guard let urlString = source.icon_url, let url = URL(string: urlString) else { continue }
+                
+                do {
+                    let (data, _) = try await session.data(from: url)
+                    if let image = NSImage(data: data) {
+                        await MainActor.run {
+                            FaviconStore.shared.inject(image: image, for: source.domain)
+                        }
                     }
-                }
+                } catch { continue }
             }
         }
     }
     
-    // MARK: - FILTERING & MIXING LOGIC
+    // MARK: - UI RECONSTRUCTION
     
     private func rebuildUI() async {
-        let mixed = mixFeeds(allFeedItems)
+        var unified: [UnifiedItem] = []
+        var liveCategories = Set<String>()
         
-        if let weather = await fetchWeather() {
-            var final = mixed
-            final.insert(weather, at: 0)
-            self.items = Array(final.prefix(500))
-        } else {
-            self.items = Array(mixed.prefix(500))
+        for source in sources {
+            let cat = source.category ?? "General"
+            liveCategories.insert(cat)
+            unified.append(UnifiedItem(
+                id: source.id,
+                name: source.name,
+                category: cat,
+                settingKey: source.settingKey,
+                isPersonal: false,
+                defaultEnabled: source.defaultEnabled,
+                domain: source.domain
+            ))
         }
         
-        self.itemsRevision += 1
-    }
-    
-    private func mixFeeds(_ items: [TickerItem]) -> [TickerItem] {
-        let currentCustomFeeds = loadCustomFeedsList()
+        let currentCustoms = loadCustomFeedsList()
+        self.customFeeds = currentCustoms
         
-        let allowedItems = items.filter { item in
-            // 1. Weather is always allowed
-            if item.value == "Weather" { return true }
+        for c in currentCustoms {
+            let savedCat = c.category ?? ""
+            let bestCat: String
             
-            // 2. Custom Feeds (User added)
-            if let customMatch = currentCustomFeeds.first(where: { $0.name == item.sourceName }) {
-                let key = "custom_enabled_\(customMatch.id.uuidString)"
-                return UserDefaults.standard.object(forKey: key) as? Bool ?? true
+            // ✅ FIX: No more await inside ternary. This resolves the line 133 warning.
+            if !savedCat.isEmpty && savedCat != "General" && savedCat != "RSS" && liveCategories.contains(savedCat) {
+                bestCat = savedCat
+            } else {
+                bestCat = await CategoryNormalizer.match(feedName: c.name, url: c.url, liveCategories: liveCategories)
             }
             
-            // 3. Server Feeds
-            // PRIORITY A: Exact Name Match (Fixes the arXiv/multiple-feed issue)
+            unified.append(UnifiedItem(
+                id: c.id,
+                name: c.name,
+                category: bestCat,
+                settingKey: "custom_enabled_\(c.id.uuidString)",
+                isPersonal: true,
+                defaultEnabled: true,
+                domain: c.domain
+            ))
+        }
+        
+        self.unifiedSources = unified
+        let mixed = mixFeeds(allFeedItems)
+        var finalItems = mixed
+        if let weather = await fetchWeather() { finalItems.insert(weather, at: 0) }
+        
+        self.items = Array(finalItems.prefix(500))
+        self.itemsRevision += 1
+    }
+
+    func startAutoRefresh(interval: TimeInterval) {
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            // ✅ FIX: Bridging background timer thread to MainActor FeedManager
+            Task { @MainActor in
+                self?.hardRefresh()
+            }
+        }
+    }
+
+    // MARK: - HELPERS & PERSISTENCE
+    
+    private func mixFeeds(_ items: [TickerItem]) -> [TickerItem] {
+        let currentCustomFeeds = self.customFeeds
+        let allowedItems = items.filter { item in
+            if item.value == "Weather" { return true }
+            if let customMatch = currentCustomFeeds.first(where: { $0.name == item.sourceName }) {
+                return UserDefaults.standard.object(forKey: "custom_enabled_\(customMatch.id.uuidString)") as? Bool ?? true
+            }
             if let exactSource = sources.first(where: { $0.name == item.sourceName }) {
                 return UserDefaults.standard.object(forKey: exactSource.settingKey) as? Bool ?? exactSource.defaultEnabled
             }
-            
-            // PRIORITY B: Domain Fallback
-            if let domainSource = sources.first(where: { $0.domain == item.sourceDomain }) {
-                return UserDefaults.standard.object(forKey: domainSource.settingKey) as? Bool ?? domainSource.defaultEnabled
-            }
-            
             return true
         }
         
@@ -211,19 +255,43 @@ final class FeedManager: NSObject, ObservableObject {
         return out
     }
     
-    // MARK: - LOAD / SAVE HELPERS
-    
     private func loadCustomFeeds() {
-        if let data = UserDefaults.standard.data(forKey: "custom_feeds"),
-           let saved = try? JSONDecoder().decode([CustomFeed].self, from: data) {
-            for feed in saved {
-                self.customFeedsMap[feed.id] = feed
-            }
+        let feeds = loadCustomFeedsList()
+        for feed in feeds { self.customFeedsMap[feed.id] = feed }
+        self.customFeeds = feeds
+    }
+
+    private func loadCustomFeedsList() -> [CustomFeed] {
+        if let jsonString = UserDefaults.standard.string(forKey: "customFeeds"),
+           let data = jsonString.data(using: .utf8),
+           let feeds = try? JSONDecoder().decode([CustomFeed].self, from: data) {
+            return feeds
+        }
+        return []
+    }
+
+    private func saveCustomFeedsList(_ feeds: [CustomFeed]) {
+        if let data = try? JSONEncoder().encode(feeds),
+           let jsonString = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(jsonString, forKey: "customFeeds")
         }
     }
-    
-    // MARK: - WEATHER
-    
+
+    func addCustomFeed(_ feed: CustomFeed) {
+        var current = loadCustomFeedsList()
+        current.append(feed)
+        saveCustomFeedsList(current)
+        self.customFeedsMap[feed.id] = feed
+        softRefresh()
+    }
+
+    func removeCustomFeed(at offsets: IndexSet) {
+        var current = loadCustomFeedsList()
+        current.remove(atOffsets: offsets)
+        saveCustomFeedsList(current)
+        softRefresh()
+    }
+
     func fetchWeather() async -> TickerItem? {
         let city = UserDefaults.standard.string(forKey: "weatherCity") ?? "Dublin"
         let geocoder = CLGeocoder()
@@ -241,66 +309,28 @@ final class FeedManager: NSObject, ObservableObject {
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let current = json["current_weather"] as? [String: Any],
                let temp = current["temperature"] as? Double {
-                
                 let tempStr = "\(Int(temp))°C"
                 self.currentWeatherTemp = tempStr
-                
-                return TickerItem(
-                    text: "\(city.uppercased()): \(tempStr)",
-                    type: .news,
-                    value: "Weather",
-                    score: nil,
-                    sourceDomain: "open-meteo.com",
-                    sourceName: "Local Weather",
-                    sourceIcon: nil,
-                    mediaURL: nil,
-                    isVideo: false,
-                    articleURL: URL(string: "https://weather.com")!,
-                    publishedAt: Date()
-                )
+                return TickerItem(text: "\(city.uppercased()): \(tempStr)", type: .news, value: "Weather", score: nil, sourceDomain: "open-meteo.com", sourceName: "Local Weather", sourceIcon: nil, mediaURL: nil, isVideo: false, articleURL: URL(string: "https://weather.com")!, publishedAt: Date())
             }
         } catch { return nil }
         return nil
     }
-    
-    // MARK: - SETTINGS HELPERS
-    
+
     func validateAndAddCustomRSS(urlString: String, providedName: String) async throws -> CustomFeed {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
-        
         let (data, _) = try await session.data(from: url)
-        
         guard let str = String(data: data, encoding: .utf8), str.contains("<rss") || str.contains("<feed") else {
             throw URLError(.cannotParseResponse)
         }
         
-        // Pass STRING to normalizedDomain
         let domain = BrandIconProvider.normalizedDomain(urlString)
         let name = providedName.isEmpty ? domain : providedName
-        
-        let newFeed = CustomFeed(
-            name: name,
-            url: urlString,
-            category: "RSS",
-            domain: domain
-        )
-        
-        DispatchQueue.main.async {
-            var currentFeeds = self.loadCustomFeedsList()
-            currentFeeds.append(newFeed)
-            self.saveCustomFeedsList(currentFeeds)
-            self.customFeedsMap[newFeed.id] = newFeed
-        }
-        
+        let newFeed = CustomFeed(name: name, url: urlString, category: "RSS", domain: domain)
+        addCustomFeed(newFeed)
         return newFeed
     }
-    
-    func startAutoRefresh(interval: TimeInterval) {
-        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.hardRefresh()
-        }
-    }
-    
+
     func refreshWeatherOnly() {
         Task {
             if let w = await fetchWeather() {
@@ -309,32 +339,13 @@ final class FeedManager: NSObject, ObservableObject {
                 } else {
                     self.items.insert(w, at: 0)
                 }
+                self.itemsRevision += 1
             }
         }
     }
-    
-    // MARK: - PERSISTENCE
-    
-    private func loadCustomFeedsList() -> [CustomFeed] {
-        if let jsonString = UserDefaults.standard.string(forKey: "customFeeds"),
-           let data = jsonString.data(using: .utf8),
-           let feeds = try? JSONDecoder().decode([CustomFeed].self, from: data) {
-            return feeds
-        }
-        return []
-    }
-    
-    private func saveCustomFeedsList(_ feeds: [CustomFeed]) {
-        if let data = try? JSONEncoder().encode(feeds),
-           let jsonString = String(data: data, encoding: .utf8) {
-            UserDefaults.standard.set(jsonString, forKey: "customFeeds")
-        }
-    }
-    
-    // MARK: - COUNTER (CASE INSENSITIVE)
+
     func itemCount(for sourceName: String) -> Int {
         let needle = sourceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        
         return allFeedItems.filter {
             $0.sourceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == needle
         }.count

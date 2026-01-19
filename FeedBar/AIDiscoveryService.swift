@@ -1,9 +1,9 @@
 import Foundation
 
+@MainActor
 class AIDiscoveryService {
     static let shared = AIDiscoveryService()
     
-    // Ensure this points to your valid Secrets file
     private let apiKey = Secrets.openAIKey
 
     func discoverFeeds(for topic: String) async throws -> [CustomFeed] {
@@ -47,23 +47,23 @@ class AIDiscoveryService {
             return []
         }
         
-        // Use the AIResponse model we added to Models.swift
+        // ✅ Using the global AIResponse model instead of a local redeclaration
         let decodedResponse = try JSONDecoder().decode(AIResponse.self, from: jsonData)
         let candidates = decodedResponse.feeds
         
         var validFeeds: [CustomFeed] = []
         
-        // Parallel Validation Group
+        // Use TaskGroup to verify URLs in parallel
         await withTaskGroup(of: CustomFeed?.self) { group in
             for feedItem in candidates {
                 group.addTask {
                     if await self.verifyURL(feedItem.url) {
-                        // Bridge AIFeedItem -> CustomFeed
-                        return CustomFeed(
+                        // ✅ Swift 6 Fix: Awaiting MainActor-isolated init and static methods
+                        return await CustomFeed(
                             name: feedItem.name,
                             url: feedItem.url,
                             category: feedItem.category,
-                            domain: BrandIconProvider.normalizedDomain(feedItem.url)
+                            domain: await BrandIconProvider.normalizedDomain(feedItem.url)
                         )
                     }
                     return nil
@@ -80,7 +80,7 @@ class AIDiscoveryService {
         return validFeeds
     }
     
-    private func verifyURL(_ urlString: String) async -> Bool {
+    nonisolated private func verifyURL(_ urlString: String) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
@@ -104,7 +104,6 @@ class AIDiscoveryService {
     }
 }
 
-// Wrapper for OpenAI's nested chat completion structure
 private struct OpenAIResponse: Codable {
     struct Choice: Codable {
         struct Message: Codable {
