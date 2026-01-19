@@ -10,19 +10,18 @@ enum OpenAIService {
     private static let modelPrimary = "gpt-4o"
     private static let modelFallback = "gpt-4o-mini" // Cheaper, faster fallback
 
-    // MARK: - Sentiment Analysis (Existing)
+    // MARK: - Sentiment Analysis
     static func classifySentimentAndSummarize(
         session: URLSession,
         apiKey: String,
         headlines: [String]
-    ) async throws -> FeedManager.NewsSentiment {
+    ) async throws -> NewsSentiment { // ✅ FIXED: Removed FeedManager.
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OpenAIError(message: "Missing OpenAI API key.")
         }
 
         let prompt = buildSentimentPrompt(headlines: headlines)
 
-        // Try primary model, then fallback if needed.
         do {
             return try await callSentiment(session: session, apiKey: apiKey, model: modelPrimary, prompt: prompt)
         } catch {
@@ -30,92 +29,46 @@ enum OpenAIService {
         }
     }
 
-    // MARK: - NEW: General 3-Word Summary (For Future/Trends)
-    // ... inside OpenAIService
-        static func generateThreeWordSummary(
-            session: URLSession,
-            apiKey: String,
-            headlines: [String],
-            context: String
-        ) async throws -> String {
-            guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw OpenAIError(message: "Missing OpenAI API key.")
-            }
-            
-            let textChunk = headlines.prefix(25).map { "- \($0)" }.joined(separator: "\n")
-            
-            let prompt = """
-            Analyze these headlines regarding "\(context)".
-            Identify the single most specific, dominant trend or event.
-            Output EXACTLY three words that summarize it.
-            
-            CRITICAL RULES:
-            1. NO generic pairings like "TECHNOLOGY AND SOCIETY" or "DATA AND AI".
-            2. NO conjunctions ("AND", "&").
-            3. Use CONCRETE NOUNS and ACTIVE VERBS.
-            4. Be provocative and specific.
-            
-            Bad examples: "GLOBAL TECH TRENDS", "SCIENCE AND NATURE", "AI UPDATES"
-            Good examples: "NVIDIA CRUSHES EARNINGS", "GLACIER COLLAPSE IMMINENT", "AGENTIC AI SWARM"
-            
-            Format: UPPERCASE. No punctuation.
-            
-            Headlines:
-            \(textChunk)
-            """
-            
-            return try await callSummary(session: session, apiKey: apiKey, model: modelFallback, prompt: prompt)
+    // MARK: - 3-Word Summary (For Future/Trends)
+    static func generateThreeWordSummary(
+        session: URLSession,
+        apiKey: String,
+        headlines: [String],
+        context: String
+    ) async throws -> String {
+        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpenAIError(message: "Missing OpenAI API key.")
         }
-
-    // MARK: - Prompts & Helpers
-
-    // ... inside OpenAIService ...
-
-        private static func buildSentimentPrompt(headlines: [String]) -> String {
-            let clipped = headlines.prefix(50).map { "- \($0)" }.joined(separator: "\n")
-            return """
-            Analyze these headlines for market/social sentiment.
-            
-            Task:
-            1. Determine the sentiment level (green/amber/red).
-            2. Write a 3-word summary of the DOMINANT EVENT or THEME.
-            
-            CRITICAL RULES for Summary:
-            - NO generic words: "NEWS", "HEADLINES", "UPDATES", "REPORT", "GLOBAL", "MIXED", "SITUATION".
-            - NO conjunctions: "AND", "&".
-            - BE SPECIFIC: Name the conflict, the market movement, or the crisis.
-            - If mixed, pick the loudest/most dangerous signal.
-            
-            Good Examples:
-            - "OIL PRICES SURGE"
-            - "TECH STOCKS CRASH"
-            - "BORDER CRISIS ESCALATES"
-            - "PEACE TALKS STALL"
-            
-            Bad Examples:
-            - "MIXED GLOBAL NEWS" (Banned)
-            - "POLITICAL UPDATES" (Banned)
-            - "WORLD NEWS TODAY" (Banned)
-
-            Return JSON:
-            {
-              "level": "green" | "amber" | "red",
-              "threeWordSummary": "THREE WORDS HERE"
-            }
-
-            Headlines:
-            \(clipped)
-            """
-        }
+        
+        let textChunk = headlines.prefix(25).map { "- \($0)" }.joined(separator: "\n")
+        
+        let prompt = """
+        Analyze these headlines regarding "\(context)".
+        Identify the single most specific, dominant trend or event.
+        Output EXACTLY three words that summarize it.
+        
+        CRITICAL RULES:
+        1. NO generic pairings like "TECHNOLOGY AND SOCIETY" or "DATA AND AI".
+        2. NO conjunctions ("AND", "&").
+        3. Use CONCRETE NOUNS and ACTIVE VERBS.
+        4. Be provocative and specific.
+        
+        Format: UPPERCASE. No punctuation.
+        
+        Headlines:
+        \(textChunk)
+        """
+        
+        return try await callSummary(session: session, apiKey: apiKey, model: modelFallback, prompt: prompt)
+    }
 
     // MARK: - API Calls
-
     private static func callSentiment(
         session: URLSession,
         apiKey: String,
         model: String,
         prompt: String
-    ) async throws -> FeedManager.NewsSentiment {
+    ) async throws -> NewsSentiment { // ✅ FIXED: Removed FeedManager.
         guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
             throw OpenAIError(message: "Bad OpenAI endpoint URL.")
         }
@@ -132,7 +85,6 @@ enum OpenAIService {
 
         let data = try await performRequest(session: session, url: url, apiKey: apiKey, body: body)
         
-        // Parse JSON response
         guard
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let choices = obj["choices"] as? [[String: Any]],
@@ -147,10 +99,11 @@ enum OpenAIService {
             throw OpenAIError(message: "Could not parse OpenAI sentiment response.")
         }
 
-        let level = FeedManager.NewsSentiment.Level(rawValue: levelStr.lowercased()) ?? .amber
+        // ✅ FIXED: Removed FeedManager prefix from Level and Init
+        let level = NewsSentiment.Level(rawValue: levelStr.lowercased()) ?? .amber
         let cleanThree = three.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return FeedManager.NewsSentiment(level: level, threeWordSummary: cleanThree, computedAt: Date())
+        return NewsSentiment(level: level, threeWordSummary: cleanThree, computedAt: Date())
     }
     
     private static func callSummary(
@@ -175,7 +128,6 @@ enum OpenAIService {
 
         let data = try await performRequest(session: session, url: url, apiKey: apiKey, body: body)
         
-        // Parse simple text response
         guard
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let choices = obj["choices"] as? [[String: Any]],
@@ -193,7 +145,6 @@ enum OpenAIService {
             .uppercased()
     }
     
-    // Shared Network Helper
     private static func performRequest(session: URLSession, url: URL, apiKey: String, body: [String: Any]) async throws -> Data {
         let bodyData = try JSONSerialization.data(withJSONObject: body, options: [])
         
@@ -214,5 +165,16 @@ enum OpenAIService {
         }
         
         return data
+    }
+    
+    // Helper to build the prompt for sentiment analysis
+    private static func buildSentimentPrompt(headlines: [String]) -> String {
+        let clipped = headlines.prefix(50).map { "- \($0)" }.joined(separator: "\n")
+        return """
+        Analyze these headlines for market/social sentiment.
+        Return JSON with level (green/amber/red) and threeWordSummary.
+        Headlines:
+        \(clipped)
+        """
     }
 }

@@ -157,33 +157,35 @@ final class RSSParser: NSObject, XMLParserDelegate, @unchecked Sendable {
     }
 
     private func finalizeCurrent() {
-        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanTitle.isEmpty else { return }
+            let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanTitle.isEmpty else { return }
 
-        let linkStr = link.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let articleURL = URL(string: linkStr), !linkStr.isEmpty else { return }
+            let linkStr = link.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let articleURL = URL(string: linkStr), !linkStr.isEmpty else { return }
 
-        let domain = source.domain.isEmpty ? (articleURL.host ?? "unknown") : source.domain
-        let topicValue = topicName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? source.category.uppercased() : topicName.uppercased()
+            let domain = source.domain.isEmpty ? (articleURL.host ?? "unknown") : source.domain
+            let topicValue = topicName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? source.category.uppercased() : topicName.uppercased()
 
-        let candidateMedia = mediaURL ?? enclosureURL
-        let isVideo = candidateMedia?.pathExtension.lowercased() == "mp4"
+            let candidateMedia = mediaURL ?? enclosureURL
+            let isVideo = candidateMedia?.pathExtension.lowercased() == "mp4"
 
-        let item = TickerItem(
-            text: cleanTitle,
-            type: type,
-            value: topicValue,
-            score: nil,
-            sourceDomain: domain,
-            sourceName: source.name,
-            mediaURL: candidateMedia,
-            isVideo: isVideo,
-            articleURL: articleURL,
-            publishedAt: pubDate
-        )
+            // ✅ FIXED: Mapping local variables to the TickerItem initializer
+            let item = TickerItem(
+                text: cleanTitle,
+                type: self.type,               // Uses the type passed into init
+                value: topicValue,             // e.g., "TECH", "POLITICS"
+                score: nil,
+                sourceDomain: domain,
+                sourceName: source.name,       // Accessing source property
+                sourceIcon: nil,               // Missing parameter fixed (nil is valid URL?)
+                mediaURL: candidateMedia,      // Combined media logic
+                isVideo: isVideo,
+                articleURL: articleURL,
+                publishedAt: pubDate           // Uses the parsed date
+            )
 
-        items.append(item)
-    }
+            items.append(item)
+        }
 
     // MARK: - Date parsing
 

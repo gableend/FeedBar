@@ -87,11 +87,12 @@ class PythonTrendAdapter: TrendProvider {
                                 
                                 return TickerItem(
                                     text: trend.title,
-                                    type: .news,              // Changed to .news to ensure UI loads favicon
-                                    value: "TRENDS",          // Main Eyebrow
-                                    score: trend.volume,      // "500K+" Badge
-                                    sourceDomain: displayDomain, // Valid domain for FaviconStore
-                                    sourceName: trend.source, // "Hacker News" (Display Text)
+                                    type: .news,               // Changed to .news to ensure UI loads favicon
+                                    value: "TRENDS",           // Main Eyebrow
+                                    score: trend.volume,       // "500K+" Badge
+                                    sourceDomain: displayDomain,
+                                    sourceName: trend.source,  // "Hacker News"
+                                    sourceIcon: nil,           // ✅ FIXED: Added missing URL? parameter
                                     mediaURL: nil,
                                     isVideo: false,
                                     articleURL: URL(string: trend.url) ?? URL(string: "https://google.com")!,

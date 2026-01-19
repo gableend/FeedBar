@@ -372,6 +372,7 @@ final class OGImageEnricher {
                     score: item.score,
                     sourceDomain: item.sourceDomain,
                     sourceName: item.sourceName,
+                    sourceIcon: nil, // ✅ FIXED: Added missing parameter
                     mediaURL: cached,
                     isVideo: item.isVideo,
                     articleURL: item.articleURL,
@@ -398,6 +399,7 @@ final class OGImageEnricher {
                     score: item.score,
                     sourceDomain: item.sourceDomain,
                     sourceName: item.sourceName,
+                    sourceIcon: nil, // ✅ FIXED: Added missing parameter
                     mediaURL: img,
                     isVideo: item.isVideo,
                     articleURL: item.articleURL,

@@ -1,204 +1,223 @@
- import Foundation
+import Foundation
 import SwiftUI
 
-// MARK: - 1. FEEDS BRAND KIT
+// MARK: - 1. SENTIMENT MODEL
+struct NewsSentiment: Codable {
+    enum Level: String, Codable {
+        case green, amber, red
+    }
+    let level: Level
+    let threeWordSummary: String
+    let computedAt: Date
+}
+
+// MARK: - 2. FEEDS BRAND KIT
 struct FeedsTheme {
     static let background = Color(hex: "0E0F11")
     static let primaryText = Color(hex: "F4F5F7")
     static let secondaryText = Color(hex: "8A8F98")
     static let divider = Color(hex: "1A1C1F")
 
-    // Category Accents
-    static let news = Color(hex: "5E6B8A")       // Slate Blue
-    static let futurism = Color(hex: "7A6FF0")   // Desaturated Violet
-    static let ai = Color(hex: "4C7DFF")         // Signal Blue
-    static let trends = Color(hex: "4FA3A5")     // Muted Teal
-    static let utility = Color(hex: "C9A24D")    // Soft Amber
+    static let news = Color(hex: "5E6B8A")
+    static let futurism = Color(hex: "7A6FF0")
+    static let ai = Color(hex: "4C7DFF")
+    static let trends = Color(hex: "4FA3A5")
+    static let utility = Color(hex: "C9A24D")
 
     static func categoryColor(for category: String) -> Color {
         let c = category.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-
         if c.contains("AI") || c.contains("RESEARCH") { return FeedsTheme.ai }
-        if c.contains("TECH") || c.contains("PROGRAMMING") || c.contains("COMPANY") || c.contains("ENGINEERING") { return FeedsTheme.futurism }
-        if c.contains("BUSINESS") || c.contains("FINANCE") || c.contains("MARKET") || c.contains("ECONOM") { return FeedsTheme.trends }
-        if c.contains("SPORT") { return FeedsTheme.trends }
-        if c.contains("TREND") { return FeedsTheme.trends }
+        if c.contains("TECH") || c.contains("PROGRAMMING") { return FeedsTheme.futurism }
+        if c.contains("BUSINESS") || c.contains("FINANCE") || c.contains("MARKET") { return FeedsTheme.trends }
         if c.contains("WEATHER") || c.contains("UTILITY") { return FeedsTheme.utility }
-        if c.contains("FUTURE") { return FeedsTheme.futurism }
-        if c.contains("TOPIC") || c.contains("TOPICS") { return FeedsTheme.ai }
-
         return FeedsTheme.news
     }
 }
 
-// MARK: - 2. TICKER ITEM MODEL
-struct TickerItem: Identifiable, Hashable, Equatable, Codable {
-    // Keep UUID for SwiftUI Identifiable, but DO NOT use it for equality/hash.
-    // We override Hashable/Equatable below with a stable identity.
-    var id = UUID()
+// MARK: - 3. CUSTOM FEED MODELS (Missing Types Restored)
+struct CustomFeed: Identifiable, Codable, Hashable {
+    let id: UUID
+    let name: String
+    let url: String
+    let category: String?
+    let domain: String
+    
+    init(id: UUID = UUID(), name: String, url: String, category: String? = nil, domain: String) {
+        self.id = id
+        self.name = name
+        self.url = url
+        self.category = category
+        self.domain = domain
+    }
+}
 
+struct CustomFeedStorage: RawRepresentable {
+    var feeds: [CustomFeed]
+    public init(feeds: [CustomFeed]) { self.feeds = feeds }
+    public init?(rawValue: String) {
+        guard let data = rawValue.data(using: .utf8),
+              let result = try? JSONDecoder().decode([CustomFeed].self, from: data)
+        else { return nil }
+        self.feeds = result
+    }
+    public var rawValue: String {
+        guard let data = try? JSONEncoder().encode(feeds),
+              let result = String(data: data, encoding: .utf8)
+        else { return "[]" }
+        return result
+    }
+}
+
+// MARK: - 2. FEED SOURCE MODEL (The Source of Truth)
+struct FeedSource: Identifiable, Codable, Hashable {
+    let id: UUID
+    let name: String
+    let url: String
+    let domain: String
+    let defaultEnabled: Bool
+    let category: String
+    
+    // Map JSON keys (snake_case) to Swift properties (camelCase)
+    enum CodingKeys: String, CodingKey {
+        case id, name, url, domain, category
+        case defaultEnabled = "default_enabled"
+    }
+    
+    // Unique key for UserDefaults
+    var settingKey: String { "source_\(domain)" }
+}
+
+// MARK: - 5. TICKER ITEM MODEL
+struct TickerItem: Identifiable, Hashable, Equatable, Codable {
+    var id = UUID()
     let text: String
     let type: TickerType
-
-    // "value" is the main Eyebrow (e.g., "NEWS", "TRENDS", "Man Utd")
     let value: String?
-
-    // "score" is the secondary data badge (e.g. "500K+", "98%")
     let score: String?
-
     let sourceDomain: String
     let sourceName: String
+    let sourceIcon: URL?
     let mediaURL: URL?
     let isVideo: Bool
     let articleURL: URL
-
-    // NEW: publish date for dedupe + UI
     let publishedAt: Date?
+    // Helper for the UI to show "CATEGORY • 10:00 AM"
+        var signalLabelWithDate: String {
+            let label = value?.uppercased() ?? "NEWS"
+            guard let date = publishedAt else { return label }
+            
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "h:mm a" // e.g. "10:00 AM"
+            let timeStr = formatter.string(from: date)
+            
+            return "\(label) • \(timeStr)"
+        }
+    // Manual Initializer
+    init(text: String, type: TickerType, value: String?, score: String?, sourceDomain: String, sourceName: String, sourceIcon: URL?, mediaURL: URL?, isVideo: Bool, articleURL: URL, publishedAt: Date?) {
+        self.id = UUID()
+        self.text = text
+        self.type = type
+        self.value = value
+        self.score = score
+        self.sourceDomain = sourceDomain
+        self.sourceName = sourceName
+        self.sourceIcon = sourceIcon
+        self.mediaURL = mediaURL
+        self.isVideo = isVideo
+        self.articleURL = articleURL
+        self.publishedAt = publishedAt
+    }
 
-    // Logic: Map Content -> Signal Colour
+    // Decoding Bridge (For Supabase/Netlify JSON)
+        enum CodingKeys: String, CodingKey {
+            case text = "title"
+            case value = "category"
+            case mediaURL = "image_url"
+            case articleURL = "url"
+            case publishedAt = "published_at"
+            case sourceName = "source_name"
+            case sourceDomain = "source_domain"
+            case sourceIcon = "source_icon"
+            case type, score, isVideo
+        }
+
+    // Aggressive Data Scrubbing Initializer
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            
+            // 1. Clean Text Fields (Fixes layout breaking newlines)
+            let rawText = try container.decode(String.self, forKey: .text)
+            self.text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            let rawName = try container.decode(String.self, forKey: .sourceName)
+            self.sourceName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            let rawDomain = try container.decode(String.self, forKey: .sourceDomain)
+            self.sourceDomain = rawDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if let rawValue = try container.decodeIfPresent(String.self, forKey: .value) {
+                self.value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                self.value = nil
+            }
+            
+            if let rawScore = try container.decodeIfPresent(String.self, forKey: .score) {
+                self.score = rawScore.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                self.score = nil
+            }
+
+            // 2. Clean URLs (Fixes crashers)
+            let rawArticle = try container.decode(String.self, forKey: .articleURL)
+            let cleanArticle = rawArticle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let valid = URL(string: cleanArticle) {
+                self.articleURL = valid
+            } else if let escaped = cleanArticle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                      let validEscaped = URL(string: escaped) {
+                self.articleURL = validEscaped
+            } else {
+                self.articleURL = URL(string: "https://feeds.bar/invalid")!
+            }
+            
+            if let rawMedia = try container.decodeIfPresent(String.self, forKey: .mediaURL) {
+                let clean = rawMedia.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.mediaURL = (clean.hasPrefix("http")) ? URL(string: clean) : nil
+            } else {
+                self.mediaURL = nil
+            }
+            
+            if let rawIcon = try container.decodeIfPresent(String.self, forKey: .sourceIcon) {
+                let clean = rawIcon.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.sourceIcon = (clean.hasPrefix("http")) ? URL(string: clean) : nil
+            } else {
+                self.sourceIcon = nil
+            }
+
+            // 3. Standard Types
+            self.publishedAt = try container.decodeIfPresent(Date.self, forKey: .publishedAt)
+            self.type = try container.decodeIfPresent(TickerType.self, forKey: .type) ?? .news
+            self.isVideo = try container.decodeIfPresent(Bool.self, forKey: .isVideo) ?? false
+            self.id = UUID()
+        }
+
     var accentColor: Color {
-        // Prefer a category-based color if available (value carries topicName or category)
-        if let v = value, !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return FeedsTheme.categoryColor(for: v)
-        }
-
-        if sourceName == "Local Weather" { return FeedsTheme.utility }
-
-        // Safety: If it's labeled TRENDS, always use the trends color
-        if signalLabel == "TRENDS" { return FeedsTheme.trends }
-
-        switch type {
-        case .news: return FeedsTheme.news
-        case .prediction: return FeedsTheme.futurism
-        case .trend: return FeedsTheme.trends
-        }
+        if let v = value { return FeedsTheme.categoryColor(for: v) }
+        return FeedsTheme.news
     }
 
-    // Logic: Map Content -> Eyebrow Text (no date)
-    var signalLabel: String {
-        if sourceName == "Local Weather" { return "UTILITY" }
+    var signalLabel: String { value?.uppercased() ?? "NEWS" }
 
-        if let val = value, !val.isEmpty {
-            return val.uppercased()
-        }
-        return "NEWS"
-    }
-
-    // Use this in the UI for the eyebrow, so “duplicates” look distinct.
-    // Example: "NEWS Jan 11"
-    var signalLabelWithDate: String {
-        guard let d = publishedAt else { return signalLabel }
-        return "\(signalLabel) \(Self.shortDate(d))"
-    }
-
-    static func shortDate(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale.current
-
-        let calendar = Calendar.current
-        let now = Date()
-
-        let sameYear = calendar.component(.year, from: d) == calendar.component(.year, from: now)
-        f.dateFormat = sameYear ? "MMM d" : "MMM d, yyyy"
-
-        return f.string(from: d)
-    }
-
-
-    // Stable key for Set dedupe. This is the important bit.
-    // We do NOT include mediaURL because it changes when OG enrichment happens.
-    private var stableIdentity: String {
-        let url = articleURL.absoluteString
-        let src = sourceName
-        let pub = publishedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "0"
-        let title = text.lowercased()
-        return "\(src)|\(url)|\(pub)|\(title)"
-    }
-
-    static func == (lhs: TickerItem, rhs: TickerItem) -> Bool {
-        lhs.stableIdentity == rhs.stableIdentity
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(stableIdentity)
-    }
+    private var stableIdentity: String { "\(sourceName)|\(articleURL.absoluteString)|\(text)" }
+    static func == (lhs: TickerItem, rhs: TickerItem) -> Bool { lhs.stableIdentity == rhs.stableIdentity }
+    func hash(into hasher: inout Hasher) { hasher.combine(stableIdentity) }
 }
 
 enum TickerType: String, Codable, Hashable {
     case news, trend, prediction
 }
 
-// MARK: - 3. DATA STRUCTURES
-struct FeedSource: Identifiable {
-    let id = UUID()
-    let name: String
-    let url: String
-    let domain: String
-    let defaultEnabled: Bool
-    let category: String
-
-    var settingKey: String {
-        let safe = url
-            .lowercased()
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "?", with: "_")
-            .replacingOccurrences(of: "&", with: "_")
-            .replacingOccurrences(of: "=", with: "_")
-        return "source_\(domain)_\(safe)"
-    }
-}
-
-struct CustomFeed: Identifiable, Codable, Hashable {
-    var id: UUID
-    let name: String
-    let url: String
-    let domain: String
-
-    init(id: UUID = UUID(), name: String, url: String, domain: String) {
-        self.id = id
-        self.name = name
-        self.url = url
-        self.domain = domain
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.name = try container.decode(String.self, forKey: .name)
-        self.url = try container.decode(String.self, forKey: .url)
-        self.domain = try container.decode(String.self, forKey: .domain)
-        self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-    }
-}
-
-struct CustomFeedStorage: RawRepresentable {
-    var feeds: [CustomFeed]
-    init(feeds: [CustomFeed]) { self.feeds = feeds }
-    init?(rawValue: String) {
-        guard let data = rawValue.data(using: .utf8),
-              let result = try? JSONDecoder().decode([CustomFeed].self, from: data) else { return nil }
-        self.feeds = result
-    }
-    var rawValue: String {
-        guard let data = try? JSONEncoder().encode(feeds),
-              let result = String(data: data, encoding: .utf8) else { return "[]" }
-        return result
-    }
-}
-
-struct AIResponse: Codable {
-    let feeds: [CustomFeed]
-}
-
-struct TrendData: Decodable, Identifiable {
-    let id = UUID()
-    let date: String
-    let value: Int
-    private enum CodingKeys: String, CodingKey { case date, value }
-}
-
-// MARK: - 4. HELPERS
+// MARK: - 6. HELPERS
 extension Color {
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
@@ -211,4 +230,15 @@ extension Color {
         }
         self.init(.sRGB, red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255, opacity: 1)
     }
+}
+
+// MARK: - AI DISCOVERY MODELS
+struct AIResponse: Codable {
+    let feeds: [AIFeedItem]
+}
+
+struct AIFeedItem: Codable {
+    let name: String
+    let url: String
+    let category: String?
 }
